@@ -122,7 +122,33 @@ def generate_sales_reply(
         return template
 
     # LLM path — for objections, complex questions, multi-turn
-    system_prompt = f"""You are Rahul, a friendly and professional Relationship Manager at BankRM.
+    personas = {
+        "premium": ("Arjun Sharma", "Senior Relationship Manager", "consultative, high-formality"),
+        "affluent": ("Priya Mehta", "Relationship Manager", "professional, solutions-focused"),
+        "mass": ("Rahul", "Bank Relationship Manager", "friendly, simple language"),
+    }
+    rm_name, rm_title, rm_style = personas.get(customer.segment or "mass", personas["mass"])
+
+    # Build prior objections and interactions context
+    prior_objections = [
+        turn["content"] for turn in conversation_history
+        if turn.get("role") == "user" and _classify_intent(turn["content"]) in ("PRICE_OBJECTION", "HAS_PRODUCT", "NO")
+    ]
+    callbacks_promised = any(
+        _classify_intent(turn["content"]) == "WANTS_CALLBACK"
+        for turn in conversation_history
+        if turn.get("role") == "user"
+    )
+
+    memory_context = ""
+    if prior_objections:
+        memory_context += f"\nPRIOR OBJECTIONS RAISED: {'; '.join(prior_objections[-2:])}"
+    if callbacks_promised:
+        memory_context += "\nIMPORTANT: Customer previously requested a callback — reference this."
+    if len(conversation_history) > 2:
+        memory_context += f"\nThis is turn {len(conversation_history)//2 + 1} of an ongoing conversation."
+
+    system_prompt = f"""You are {rm_name}, {rm_title} at BankRM. Communication style: {rm_style}.
 You are having a WhatsApp conversation with {customer.name}, one of the bank's {customer.segment} segment customers.
 
 CUSTOMER PROFILE:
@@ -135,6 +161,7 @@ PRODUCT OFFERED: {product.name}
 - Interest Rate: {rate}% p.a. (fixed)
 - EMI: {emi_str}/month for 5 years
 - No collateral required | Disbursal in 24 hours
+{memory_context}
 
 RULES:
 - Keep replies SHORT — max 3-4 sentences. This is WhatsApp, not email.
@@ -158,7 +185,7 @@ RULES:
     user_prompt = (
         f"Conversation so far:\n{history_text}\n"
         f"{name} just said: \"{customer_reply}\"\n\n"
-        f"Reply as Rahul (RM). Keep it short and WhatsApp-natural."
+        f"Reply as {rm_name} ({rm_title}). Keep it short and WhatsApp-natural."
     )
 
     try:

@@ -217,6 +217,81 @@ def _send_via_twilio(phone_number: str, message: str) -> Dict[str, Any]:
         return {"status": "error", "error": str(exc)}
 
 
+# ── Spam Score ────────────────────────────────────────────────────────────────
+
+_SPAM_WORDS = [
+    "limited time", "act now", "guaranteed", "100%", "risk free", "risk-free",
+    "no obligation", "winner", "free gift", "click here", "urgent", "expires today",
+    "last chance", "don't miss out", "apply now", "instant approval", "no credit check",
+    "pre-approved" if False else None,  # pre-approved is okay in banking context
+    "congratulations you", "you have been selected",
+]
+_SPAM_WORDS = [w for w in _SPAM_WORDS if w]
+
+
+def spam_score(message: str) -> dict:
+    """
+    Score a message for spam signals before sending.
+
+    Returns:
+        score (0-100, lower is better), issues list, recommendation (SEND/REVIEW/BLOCK)
+    """
+    issues = []
+    score = 0
+
+    # Spam word check
+    msg_lower = message.lower()
+    found_spam = [w for w in _SPAM_WORDS if w in msg_lower]
+    if found_spam:
+        score += len(found_spam) * 10
+        issues.append(f"Spam trigger words: {', '.join(found_spam)}")
+
+    # ALL CAPS ratio
+    letters = [c for c in message if c.isalpha()]
+    if letters:
+        caps_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+        if caps_ratio > 0.3:
+            score += 20
+            issues.append(f"High CAPS ratio ({caps_ratio:.0%})")
+
+    # Emoji density
+    import re
+    emoji_count = len(re.findall(
+        r'[\U0001F300-\U0001FFFF\U00002600-\U000027FF]', message
+    ))
+    if emoji_count > 4:
+        score += 10
+        issues.append(f"Too many emojis ({emoji_count})")
+
+    # Message length
+    if len(message) > 800:
+        score += 15
+        issues.append(f"Message too long ({len(message)} chars — WhatsApp is for short messages)")
+
+    # Multiple exclamation marks
+    exclamation_count = message.count("!")
+    if exclamation_count > 3:
+        score += 10
+        issues.append(f"Excessive exclamation marks ({exclamation_count})")
+
+    score = min(score, 100)
+
+    if score >= 40:
+        recommendation = "BLOCK"
+    elif score >= 20:
+        recommendation = "REVIEW"
+    else:
+        recommendation = "SEND"
+
+    return {
+        "score": score,
+        "issues": issues,
+        "recommendation": recommendation,
+        "message_length": len(message),
+        "emoji_count": emoji_count,
+    }
+
+
 # ── Main dispatch ─────────────────────────────────────────────────────────────
 
 def send_outreach_message(
@@ -234,6 +309,34 @@ def send_outreach_message(
       twilio       → Twilio Content template + quick-reply buttons
       mock         → dev mode, no real send
     """
+    # ── Compliance: opt-out check ─────────────────────────────────────────
+    from src.database import SessionLocal as _SL, Suppression
+    from datetime import datetime as _dt
+    _db = _SL()
+    try:
+        active_suppression = _db.query(Suppression).filter(
+            Suppression.canonical_id == customer_id,
+            (Suppression.expires_at == None) | (Suppression.expires_at > _dt.utcnow())
+        ).first()
+        if active_suppression:
+            return {
+                "status": "suppressed",
+                "reason": active_suppression.reason,
+                "message": f"Customer {customer_id} is on suppression list: {active_suppression.reason}",
+            }
+    finally:
+        _db.close()
+
+    # ── Quality: spam score check ─────────────────────────────────────────
+    spam = spam_score(message)
+    if spam["recommendation"] == "BLOCK":
+        return {
+            "status": "blocked_spam",
+            "spam_score": spam["score"],
+            "issues": spam["issues"],
+            "message": "Message blocked by spam filter. Please revise before sending.",
+        }
+
     logged = log_outreach(
         customer_id=customer_id,
         message=message,

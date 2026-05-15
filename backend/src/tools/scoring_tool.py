@@ -272,3 +272,249 @@ def predict_conversion_probability(
         }
     finally:
         session.close()
+
+
+# ── Life Event Detection ──────────────────────────────────────────────────────
+
+def detect_life_events(customer_id: str) -> list:
+    """
+    Detect life events from recent transaction patterns.
+
+    Events detected:
+    - WEDDING_LIKELY: Jewellery purchase > ₹50K in last 90 days
+    - MEDICAL_EXPENSE: Hospital/pharmacy payment > ₹20K in last 60 days
+    - HAS_CHILDREN: School fee payments detected in last 6 months
+    - PROMOTION_LIKELY: Salary credit jumped > 40% vs 3 months prior
+    - FD_MATURED: FD maturity credit detected (opportunity to reinvest)
+    - TRAVEL_FREQUENT: International transactions in last 60 days
+    - LIFESTYLE_SPENDER: High restaurant + travel spend (> ₹15K/month avg)
+    - MEDICAL_LOAN_CANDIDATE: Large medical expense + no personal loan
+
+    Returns list of dicts: [{event, description, urgency, product_hint}]
+    """
+    session = SessionLocal()
+    try:
+        customer = session.query(Customer).filter_by(customer_id=customer_id).first()
+        if not customer:
+            return []
+
+        events = []
+        now = datetime.utcnow()
+
+        # Load recent transactions
+        txns_90d = session.query(Transaction).filter(
+            Transaction.customer_id == customer_id,
+            Transaction.date >= now - timedelta(days=90)
+        ).all()
+
+        txns_180d = session.query(Transaction).filter(
+            Transaction.customer_id == customer_id,
+            Transaction.date >= now - timedelta(days=180)
+        ).all()
+
+        # ── WEDDING_LIKELY ────────────────────────────────────────────────────
+        jewellery_spend = sum(
+            t.amount for t in txns_90d
+            if t.category and "jewel" in t.category.lower()
+            or (t.merchant and "jewel" in t.merchant.lower())
+        )
+        if jewellery_spend > 50_000:
+            events.append({
+                "event": "WEDDING_LIKELY",
+                "description": f"Jewellery purchase of ₹{jewellery_spend:,.0f} detected",
+                "urgency": "high",
+                "product_hint": "personal_loan",
+                "signal_strength": "strong",
+            })
+
+        # ── MEDICAL_EXPENSE ───────────────────────────────────────────────────
+        medical_spend = sum(
+            t.amount for t in txns_90d
+            if t.category and t.category.lower() in ("healthcare", "medical", "hospital", "pharmacy")
+            or (t.merchant and any(k in t.merchant.lower() for k in ["hospital", "clinic", "pharma", "health"]))
+        )
+        if medical_spend > 20_000:
+            events.append({
+                "event": "MEDICAL_EXPENSE",
+                "description": f"Medical payment of ₹{medical_spend:,.0f} detected",
+                "urgency": "high" if medical_spend > 50_000 else "medium",
+                "product_hint": "personal_loan",
+                "signal_strength": "strong",
+            })
+
+        # ── HAS_CHILDREN ──────────────────────────────────────────────────────
+        school_txns = [
+            t for t in txns_180d
+            if (t.category and "education" in t.category.lower())
+            or (t.merchant and any(k in t.merchant.lower() for k in ["school", "tuition", "academy", "fees"]))
+        ]
+        if school_txns:
+            events.append({
+                "event": "HAS_CHILDREN",
+                "description": f"School/education payments detected ({len(school_txns)} transactions)",
+                "urgency": "low",
+                "product_hint": "education_loan",
+                "signal_strength": "medium",
+            })
+
+        # ── PROMOTION_LIKELY ──────────────────────────────────────────────────
+        salary_recent = [
+            t for t in txns_90d
+            if t.category and "salary" in t.category.lower()
+        ]
+        salary_prior = [
+            t for t in txns_180d
+            if t.category and "salary" in t.category.lower()
+            and t.date < now - timedelta(days=90)
+        ]
+        if salary_recent and salary_prior:
+            avg_recent = sum(t.amount for t in salary_recent) / len(salary_recent)
+            avg_prior = sum(t.amount for t in salary_prior) / len(salary_prior)
+            if avg_prior > 0 and avg_recent > avg_prior * 1.40:
+                events.append({
+                    "event": "PROMOTION_LIKELY",
+                    "description": f"Salary jumped {((avg_recent/avg_prior)-1)*100:.0f}% — possible promotion",
+                    "urgency": "high",
+                    "product_hint": "premium_upgrade",
+                    "signal_strength": "strong",
+                })
+
+        # ── TRAVEL_FREQUENT ───────────────────────────────────────────────────
+        intl_txns = [
+            t for t in txns_90d
+            if t.category and "international" in t.category.lower()
+            or t.channel and "forex" in t.channel.lower()
+        ]
+        if intl_txns:
+            events.append({
+                "event": "TRAVEL_FREQUENT",
+                "description": f"{len(intl_txns)} international transactions in 90 days",
+                "urgency": "medium",
+                "product_hint": "travel_card",
+                "signal_strength": "medium",
+            })
+
+        # ── LIFESTYLE_SPENDER ─────────────────────────────────────────────────
+        lifestyle_monthly = sum(
+            t.amount for t in txns_90d
+            if t.category and t.category.lower() in ("restaurant", "dining", "travel", "entertainment", "shopping")
+        ) / 3  # per month avg
+        if lifestyle_monthly > 15_000:
+            events.append({
+                "event": "LIFESTYLE_SPENDER",
+                "description": f"Avg ₹{lifestyle_monthly:,.0f}/month on lifestyle (dining/travel/shopping)",
+                "urgency": "medium",
+                "product_hint": "lifestyle_credit_card",
+                "signal_strength": "medium",
+            })
+
+        # ── MEDICAL_LOAN_CANDIDATE ────────────────────────────────────────────
+        if medical_spend > 20_000 and not customer.has_personal_loan:
+            events.append({
+                "event": "MEDICAL_LOAN_CANDIDATE",
+                "description": "Large medical expense with no existing personal loan — prime candidate",
+                "urgency": "high",
+                "product_hint": "personal_loan",
+                "signal_strength": "very_strong",
+            })
+
+        return events
+
+    finally:
+        session.close()
+
+
+def get_behavioral_signals(customer_id: str) -> dict:
+    """
+    Get behavioral signals for message personalization and timing.
+
+    Returns:
+        - optimal_send_day: days since salary credit (best: 2-3)
+        - emi_deduction_risk: True if today is likely EMI day (avoid)
+        - product_affinities: list of product types customer spends on
+        - message_tone_hint: 'warm' | 'professional' | 'urgent'
+        - spend_personality: 'saver' | 'spender' | 'balanced'
+        - days_since_salary: int or None
+        - life_events: list from detect_life_events()
+    """
+    session = SessionLocal()
+    try:
+        customer = session.query(Customer).filter_by(customer_id=customer_id).first()
+        if not customer:
+            return {}
+
+        now = datetime.utcnow()
+        txns_60d = session.query(Transaction).filter(
+            Transaction.customer_id == customer_id,
+            Transaction.date >= now - timedelta(days=60)
+        ).order_by(Transaction.date.desc()).all()
+
+        # Days since last salary credit
+        salary_txns = [t for t in txns_60d if t.category and "salary" in t.category.lower()]
+        days_since_salary = None
+        if salary_txns:
+            last_salary = max(salary_txns, key=lambda t: t.date)
+            days_since_salary = (now - last_salary.date).days
+
+        # EMI deduction risk (salary earners typically get EMI deducted on 1-5th)
+        today_day = now.day
+        emi_risk = 1 <= today_day <= 5 and bool(customer.has_personal_loan or customer.has_home_loan)
+
+        # Spend personality
+        total_spend = sum(t.amount for t in txns_60d if t.amount > 0)
+        avg_balance = customer.monthly_avg_balance or 0
+        if avg_balance > 0:
+            spend_ratio = total_spend / (avg_balance * 2)  # over 2 months
+            if spend_ratio < 0.3:
+                spend_personality = "saver"
+            elif spend_ratio > 0.7:
+                spend_personality = "spender"
+            else:
+                spend_personality = "balanced"
+        else:
+            spend_personality = "balanced"
+
+        # Product affinities from spend
+        category_spend: dict = {}
+        for t in txns_60d:
+            cat = (t.category or "other").lower()
+            category_spend[cat] = category_spend.get(cat, 0) + t.amount
+
+        # Message tone hint
+        cs = customer.credit_score or 0
+        tenure = customer.relationship_years or 0
+        if customer.segment == "premium" or (cs >= 750 and tenure >= 5):
+            tone_hint = "professional"
+        elif days_since_salary and 2 <= days_since_salary <= 5:
+            tone_hint = "warm"  # peak liquidity, good mood
+        elif spend_personality == "spender":
+            tone_hint = "urgent"
+        else:
+            tone_hint = "warm"
+
+        # Optimal timing score (0-100, higher = better time to send)
+        timing_score = 50  # baseline
+        if days_since_salary is not None:
+            if 2 <= days_since_salary <= 4:
+                timing_score += 30  # sweet spot: post-salary, pre-EMI
+            elif days_since_salary <= 1:
+                timing_score += 10
+            elif days_since_salary >= 20:
+                timing_score -= 10  # low on cash
+        if emi_risk:
+            timing_score -= 30  # EMI day, customer stressed
+        timing_score = max(0, min(100, timing_score))
+
+        return {
+            "days_since_salary": days_since_salary,
+            "emi_deduction_risk": emi_risk,
+            "timing_score": timing_score,
+            "timing_label": "optimal" if timing_score >= 70 else "good" if timing_score >= 40 else "avoid",
+            "spend_personality": spend_personality,
+            "message_tone_hint": tone_hint,
+            "top_spend_categories": sorted(category_spend.items(), key=lambda x: -x[1])[:5],
+            "life_events": detect_life_events(customer_id),
+        }
+
+    finally:
+        session.close()

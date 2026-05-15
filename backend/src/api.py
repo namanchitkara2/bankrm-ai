@@ -16,7 +16,8 @@ _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("DATABASE_URL", f"sqlite:///{_BASE}/banking_crm.db")
 
 from src.database import (
-    SessionLocal, Customer, Transaction, Interaction, Product, IdentityGraph, init_db
+    SessionLocal, Customer, Transaction, Interaction, Product, IdentityGraph, init_db,
+    CadenceJob, Suppression
 )
 from src.tools.customer_tool import query_customers as _query_customers, get_customer_profile
 from src.tools.scoring_tool import score_customer_value, predict_conversion_probability
@@ -912,6 +913,329 @@ def outreach_pipeline():
             "total_replied":    len(reply_interactions),
             "total_converted":  sum(1 for i in latest_interactions if i.converted),
             "recent_replies":   recent_replies[:20],
+        }
+    finally:
+        session.close()
+
+
+# ── Campaign Builder ──────────────────────────────────────────────────────────
+
+class CampaignRequest(BaseModel):
+    product_id: str                          # e.g. "PL001", "CC001"
+    segment: Optional[str] = None            # mass, affluent, premium, or None for all
+    city: Optional[str] = None
+    min_conversion_probability: float = 0.20 # 0.0-1.0
+    tone: str = "warm"                       # warm, professional, urgent
+    max_leads: int = 20
+    sender_backend: str = "whatsapp"         # whatsapp, twilio
+
+class CampaignResponse(BaseModel):
+    campaign_id: str
+    total_leads: int
+    leads: list
+    estimated_conversions: int
+    product_name: str
+    filters_applied: dict
+
+@app.post("/api/campaigns/preview")
+def preview_campaign(req: CampaignRequest):
+    """
+    Campaign Builder — score and rank leads for a given product + segment + city.
+    Returns ranked leads with conversion probability, life events, and draft messages.
+    Does NOT send anything — preview only.
+    """
+    import uuid
+    from src.tools.scoring_tool import predict_conversion_probability, detect_life_events, get_behavioral_signals
+    from src.tools.message_tool import draft_outreach_message
+
+    session = SessionLocal()
+    try:
+        product = session.query(Product).filter_by(product_id=req.product_id).first()
+        if not product:
+            raise HTTPException(404, f"Product {req.product_id} not found")
+
+        # Build customer query with filters
+        q = session.query(Customer)
+        if req.segment:
+            q = q.filter(Customer.segment == req.segment)
+        if req.city:
+            q = q.filter(Customer.city.ilike(f"%{req.city}%"))
+
+        # Eligible segments for this product
+        if product.eligible_segments:
+            q = q.filter(Customer.segment.in_(product.eligible_segments))
+
+        # KYC must be verified
+        q = q.filter(Customer.kyc_status == "verified")
+
+        # Fetch up to 200 candidates and score them
+        candidates = q.limit(200).all()
+
+        scored_leads = []
+        for c in candidates:
+            score_result = predict_conversion_probability(c.customer_id, req.product_id)
+            prob = score_result.get("probability", 0)
+
+            if prob < req.min_conversion_probability:
+                continue
+
+            # Get behavioral signals for timing
+            signals = get_behavioral_signals(c.customer_id)
+            life_events = signals.get("life_events", [])
+            timing_score = signals.get("timing_score", 50)
+
+            # Draft message
+            try:
+                draft = draft_outreach_message(c.customer_id, req.product_id, req.tone)
+                message_preview = draft.get("message", "")[:200] + "..." if len(draft.get("message","")) > 200 else draft.get("message","")
+            except Exception:
+                message_preview = ""
+
+            scored_leads.append({
+                "customer_id": c.customer_id,
+                "name": c.name,
+                "city": c.city,
+                "segment": c.segment,
+                "credit_score": c.credit_score,
+                "annual_income": c.annual_income,
+                "conversion_probability": round(prob * 100, 1),
+                "top_signals": score_result.get("top_signals", []),
+                "life_events": [e["event"] for e in life_events],
+                "life_event_details": life_events[:2],
+                "timing_score": timing_score,
+                "timing_label": signals.get("timing_label", "good"),
+                "tone_hint": signals.get("message_tone_hint", req.tone),
+                "message_preview": message_preview,
+                "phone": None,  # Never expose in list
+            })
+
+        # Sort by conversion probability (desc), then timing score
+        scored_leads.sort(key=lambda x: (x["conversion_probability"], x["timing_score"]), reverse=True)
+        scored_leads = scored_leads[:req.max_leads]
+
+        return {
+            "campaign_id": str(uuid.uuid4())[:8].upper(),
+            "total_leads": len(scored_leads),
+            "leads": scored_leads,
+            "estimated_conversions": max(1, round(sum(l["conversion_probability"] for l in scored_leads) / 100)),
+            "product_name": product.name,
+            "filters_applied": {
+                "product": req.product_id,
+                "segment": req.segment or "all",
+                "city": req.city or "all",
+                "min_probability": req.min_conversion_probability,
+                "tone": req.tone,
+            },
+        }
+    finally:
+        session.close()
+
+
+# ── Opt-Out / DND Management ──────────────────────────────────────────────────
+
+class OptOutRequest(BaseModel):
+    customer_id: str
+    reason: str = "customer_requested"  # customer_requested, stop_reply, dnd, compliance
+    channel: str = "whatsapp"
+    days: Optional[int] = None          # None = permanent, int = suppressed for N days
+
+@app.post("/api/optout")
+def register_optout(req: OptOutRequest):
+    """Register a customer opt-out / suppression."""
+    import uuid
+    session = SessionLocal()
+    try:
+        customer = session.query(Customer).filter_by(customer_id=req.customer_id).first()
+        if not customer:
+            raise HTTPException(404, f"Customer {req.customer_id} not found")
+
+        expires_at = None
+        if req.days:
+            expires_at = datetime.utcnow() + timedelta(days=req.days)
+
+        suppression = Suppression(
+            id=str(uuid.uuid4()),
+            canonical_id=req.customer_id,
+            reason=req.reason,
+            expires_at=expires_at,
+            source=f"api_{req.channel}",
+        )
+        session.add(suppression)
+        session.commit()
+
+        return {
+            "status": "suppressed",
+            "customer_id": req.customer_id,
+            "reason": req.reason,
+            "expires_at": expires_at.isoformat() if expires_at else "permanent",
+            "message": f"Customer {customer.name} added to suppression list.",
+        }
+    finally:
+        session.close()
+
+@app.delete("/api/optout/{customer_id}")
+def remove_optout(customer_id: str):
+    """Remove suppression for a customer (they opted back in)."""
+    session = SessionLocal()
+    try:
+        deleted = session.query(Suppression).filter_by(canonical_id=customer_id).delete()
+        session.commit()
+        return {"status": "removed", "customer_id": customer_id, "records_removed": deleted}
+    finally:
+        session.close()
+
+
+# ── Follow-Up Cadence Engine ──────────────────────────────────────────────────
+
+@app.get("/api/followups/due")
+def get_due_followups():
+    """
+    Get all follow-up jobs that are due to run.
+
+    The cadence:
+      Step 0 = initial outreach (Day 0)
+      Step 1 = value-add follow-up (Day 3)
+      Step 2 = social proof (Day 7)
+      Step 3 = last attempt (Day 14)
+      Step 4 = suppress 30 days, re-enter on trigger
+    """
+    session = SessionLocal()
+    try:
+        due_jobs = session.query(CadenceJob).filter(
+            CadenceJob.status == "pending",
+            CadenceJob.next_run_at <= datetime.utcnow(),
+        ).limit(50).all()
+
+        result = []
+        for job in due_jobs:
+            customer = session.query(Customer).filter_by(customer_id=job.canonical_id).first()
+            result.append({
+                "job_id": job.job_id,
+                "customer_id": job.canonical_id,
+                "customer_name": customer.name if customer else "Unknown",
+                "product_id": job.product_id,
+                "step": job.step,
+                "step_label": ["Initial", "Follow-up (Day 3)", "Social Proof (Day 7)", "Last Attempt (Day 14)"][min(job.step, 3)],
+                "due_at": job.next_run_at.isoformat(),
+                "overdue_hours": max(0, round((datetime.utcnow() - job.next_run_at).total_seconds() / 3600, 1)),
+            })
+
+        return {
+            "due_count": len(result),
+            "jobs": result,
+        }
+    finally:
+        session.close()
+
+
+class ScheduleFollowUpRequest(BaseModel):
+    customer_id: str
+    product_id: str
+    step: int = 1  # Which step to schedule (1=day3, 2=day7, 3=day14)
+
+@app.post("/api/followups/schedule")
+def schedule_followup(req: ScheduleFollowUpRequest):
+    """Schedule the next follow-up step for a customer."""
+    import uuid
+
+    step_delays = {1: 3, 2: 7, 3: 14}
+    delay_days = step_delays.get(req.step, 3)
+
+    session = SessionLocal()
+    try:
+        job = CadenceJob(
+            job_id=str(uuid.uuid4()),
+            canonical_id=req.customer_id,
+            product_id=req.product_id,
+            next_run_at=datetime.utcnow() + timedelta(days=delay_days),
+            step=req.step,
+            status="pending",
+        )
+        session.add(job)
+        session.commit()
+
+        step_labels = {1: "Day 3 follow-up", 2: "Day 7 social proof", 3: "Day 14 last attempt"}
+        return {
+            "status": "scheduled",
+            "job_id": job.job_id,
+            "step": req.step,
+            "step_label": step_labels.get(req.step, "Follow-up"),
+            "scheduled_for": job.next_run_at.isoformat(),
+        }
+    finally:
+        session.close()
+
+
+# ── Morning Digest ────────────────────────────────────────────────────────────
+
+@app.get("/api/digest/morning")
+def morning_digest():
+    """
+    Morning digest for the RM — what needs attention today.
+    Returns: hot leads, due follow-ups, callbacks requested, overnight replies.
+    """
+    session = SessionLocal()
+    try:
+        now = datetime.utcnow()
+        since_yesterday = now - timedelta(hours=16)  # overnight window
+
+        # Overnight replies (customer replied while RM was offline)
+        overnight_replies = session.query(Interaction).filter(
+            Interaction.date >= since_yesterday,
+            Interaction.response != None,
+            Interaction.response != "",
+        ).order_by(Interaction.date.desc()).limit(10).all()
+
+        # Callback requested
+        callback_leads = session.query(Interaction).filter(
+            Interaction.pipeline_state == "CALLBACK_REQUESTED",
+            Interaction.date >= now - timedelta(days=7),
+        ).limit(10).all()
+
+        # Due follow-ups today
+        due_jobs = session.query(CadenceJob).filter(
+            CadenceJob.status == "pending",
+            CadenceJob.next_run_at <= now + timedelta(hours=24),
+        ).limit(10).all()
+
+        # Hot leads (INTERESTED or multiple engagements)
+        hot_leads = session.query(Interaction).filter(
+            Interaction.pipeline_state.in_(["INTERESTED", "ENGAGED"]),
+            Interaction.date >= now - timedelta(days=3),
+        ).limit(5).all()
+
+        def interaction_summary(i: Interaction):
+            c = session.query(Customer).filter_by(customer_id=i.customer_id).first()
+            return {
+                "customer_id": i.customer_id,
+                "name": c.name if c else "Unknown",
+                "city": c.city if c else None,
+                "pipeline_state": i.pipeline_state,
+                "last_message": (i.response or "")[:100],
+                "date": i.date.isoformat() if i.date else None,
+            }
+
+        return {
+            "generated_at": now.isoformat(),
+            "summary": {
+                "overnight_replies": len(overnight_replies),
+                "callbacks_due": len(callback_leads),
+                "followups_due_today": len(due_jobs),
+                "hot_leads": len(hot_leads),
+            },
+            "overnight_replies": [interaction_summary(i) for i in overnight_replies],
+            "callbacks_requested": [interaction_summary(i) for i in callback_leads],
+            "followups_due": [
+                {
+                    "job_id": j.job_id,
+                    "customer_id": j.canonical_id,
+                    "product_id": j.product_id,
+                    "step": j.step,
+                    "due_at": j.next_run_at.isoformat(),
+                }
+                for j in due_jobs
+            ],
+            "hot_leads": [interaction_summary(i) for i in hot_leads],
         }
     finally:
         session.close()

@@ -15,6 +15,7 @@ import { Route as ReasoningRouteImport } from './routes/reasoning'
 import { Route as OutreachRouteImport } from './routes/outreach'
 import { Route as CustomersRouteImport } from './routes/customers'
 import { Route as ConversationsRouteImport } from './routes/conversations'
+import { Route as CampaignRouteImport } from './routes/campaign'
 import { Route as AnalyticsRouteImport } from './routes/analytics'
 import { Route as IndexRouteImport } from './routes/index'
 
@@ -48,6 +49,11 @@ const ConversationsRoute = ConversationsRouteImport.update({
   path: '/conversations',
   getParentRoute: () => rootRouteImport,
 } as any)
+const CampaignRoute = CampaignRouteImport.update({
+  id: '/campaign',
+  path: '/campaign',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AnalyticsRoute = AnalyticsRouteImport.update({
   id: '/analytics',
   path: '/analytics',
@@ -62,6 +68,7 @@ const IndexRoute = IndexRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/analytics': typeof AnalyticsRoute
+  '/campaign': typeof CampaignRoute
   '/conversations': typeof ConversationsRoute
   '/customers': typeof CustomersRoute
   '/outreach': typeof OutreachRoute
@@ -72,6 +79,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/analytics': typeof AnalyticsRoute
+  '/campaign': typeof CampaignRoute
   '/conversations': typeof ConversationsRoute
   '/customers': typeof CustomersRoute
   '/outreach': typeof OutreachRoute
@@ -83,6 +91,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/analytics': typeof AnalyticsRoute
+  '/campaign': typeof CampaignRoute
   '/conversations': typeof ConversationsRoute
   '/customers': typeof CustomersRoute
   '/outreach': typeof OutreachRoute
@@ -95,6 +104,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/analytics'
+    | '/campaign'
     | '/conversations'
     | '/customers'
     | '/outreach'
@@ -105,6 +115,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/analytics'
+    | '/campaign'
     | '/conversations'
     | '/customers'
     | '/outreach'
@@ -115,6 +126,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/analytics'
+    | '/campaign'
     | '/conversations'
     | '/customers'
     | '/outreach'
@@ -126,6 +138,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AnalyticsRoute: typeof AnalyticsRoute
+  CampaignRoute: typeof CampaignRoute
   ConversationsRoute: typeof ConversationsRoute
   CustomersRoute: typeof CustomersRoute
   OutreachRoute: typeof OutreachRoute
@@ -178,6 +191,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ConversationsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/campaign': {
+      id: '/campaign'
+      path: '/campaign'
+      fullPath: '/campaign'
+      preLoaderRoute: typeof CampaignRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/analytics': {
       id: '/analytics'
       path: '/analytics'
@@ -198,6 +218,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AnalyticsRoute: AnalyticsRoute,
+  CampaignRoute: CampaignRoute,
   ConversationsRoute: ConversationsRoute,
   CustomersRoute: CustomersRoute,
   OutreachRoute: OutreachRoute,

@@ -12,6 +12,7 @@ import {
   Search,
   Bell,
   Command,
+  Rocket,
 } from "lucide-react";
 
 const NAV = [
@@ -19,6 +20,7 @@ const NAV = [
   { to: "/workspace", label: "RM AI Workspace", icon: Sparkles, badge: "AI" },
   { to: "/customers", label: "Customer Intelligence", icon: Users },
   { to: "/outreach", label: "Outreach Center", icon: Send },
+  { to: "/campaign", label: "Campaign Builder", icon: Rocket, badge: "NEW" },
   { to: "/conversations", label: "Conversation Console", icon: MessagesSquare },
   { to: "/reasoning", label: "Reasoning & Trace", icon: Network },
   { to: "/analytics", label: "Analytics", icon: BarChart3 },
