@@ -1,0 +1,964 @@
+"""
+FastAPI backend — exposes the Python RM-agent as a REST API so the React UI can consume it.
+"""
+import os
+import asyncio
+from typing import Optional
+from datetime import datetime, timedelta
+
+from fastapi import FastAPI, Query, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy import func
+
+# ── absolute DB path so the server can be run from any cwd ──────────────────
+_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.environ.setdefault("DATABASE_URL", f"sqlite:///{_BASE}/banking_crm.db")
+
+from src.database import (
+    SessionLocal, Customer, Transaction, Interaction, Product, IdentityGraph, init_db
+)
+from src.tools.customer_tool import query_customers as _query_customers, get_customer_profile
+from src.tools.scoring_tool import score_customer_value, predict_conversion_probability
+from src.tools.product_tool import recommend_products
+from src.tools.transaction_tool import get_transaction_summary
+from src.tools.message_tool import draft_outreach_message, _rate_for_credit_score, _emi, _fmt_inr
+from src.tools.outreach_tool import send_outreach_message as _send_outreach
+from src.tools.sales_agent import generate_sales_reply, _classify_intent
+from src.rm_agent.graph import build_rm_agent_graph, create_initial_state
+from src.config import settings
+
+app = FastAPI(title="Banking CRM Agent API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Build LangGraph once at startup
+_agent_graph = None
+
+# Semaphore: only 1 agent run touches the LLM at a time → no parallel quota burn
+_llm_semaphore = asyncio.Semaphore(1)
+
+# Sandbox session map: phone_number → {customer_id, product_id, message}
+# When sandbox mode is on, all messages go to the RM's own number.
+# We need to remember which customer context to use when that number replies.
+# Stores the LAST sent customer per sandbox number (most recent wins).
+_sandbox_sessions: dict = {}   # "+917838146286" → {"customer_id": ..., "product_id": ..., "message": ...}
+
+@app.on_event("startup")
+def startup():
+    global _agent_graph
+    init_db()
+    _agent_graph = build_rm_agent_graph()
+
+
+# ── Health ───────────────────────────────────────────────────────────────────
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+
+# ── Customers ────────────────────────────────────────────────────────────────
+
+@app.get("/api/customers")
+def list_customers(
+    segment: Optional[str] = None,
+    city: Optional[str] = None,
+    min_income: Optional[float] = None,
+    max_income: Optional[float] = None,
+    min_credit_score: Optional[int] = None,
+    min_balance: Optional[float] = None,
+    search: Optional[str] = None,
+    limit: int = Query(60, le=200),
+    offset: int = 0,
+):
+    session = SessionLocal()
+    try:
+        q = session.query(Customer)
+        if segment:
+            q = q.filter(Customer.segment == segment.lower())
+        if city:
+            q = q.filter(Customer.city.ilike(f"%{city}%"))
+        if min_income is not None:
+            q = q.filter(Customer.annual_income >= min_income)
+        if max_income is not None:
+            q = q.filter(Customer.annual_income <= max_income)
+        if min_credit_score is not None:
+            q = q.filter(Customer.credit_score >= min_credit_score)
+        if min_balance is not None:
+            q = q.filter(Customer.monthly_avg_balance >= min_balance)
+        if search:
+            q = q.filter(
+                Customer.name.ilike(f"%{search}%") |
+                Customer.city.ilike(f"%{search}%") |
+                Customer.occupation.ilike(f"%{search}%")
+            )
+        total = q.count()
+        customers = q.offset(offset).limit(limit).all()
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "items": [_customer_to_dict(c) for c in customers],
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/customers/{customer_id}")
+def get_customer(customer_id: str):
+    profile = get_customer_profile(customer_id)
+    if not profile:
+        raise HTTPException(404, f"Customer {customer_id} not found")
+    return profile
+
+
+@app.get("/api/customers/{customer_id}/transactions")
+def customer_transactions(customer_id: str, days: int = 90, limit: int = 30):
+    session = SessionLocal()
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        txns = (
+            session.query(Transaction)
+            .filter(Transaction.customer_id == customer_id, Transaction.date >= cutoff)
+            .order_by(Transaction.date.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "txn_id": t.txn_id,
+                "date": t.date.isoformat(),
+                "amount": t.amount,
+                "category": t.category,
+                "channel": t.channel,
+                "merchant": t.merchant,
+            }
+            for t in txns
+        ]
+    finally:
+        session.close()
+
+
+@app.get("/api/customers/{customer_id}/score")
+def customer_score(customer_id: str):
+    result = score_customer_value(customer_id)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
+
+
+@app.get("/api/customers/{customer_id}/recommendations")
+def customer_recommendations(customer_id: str):
+    result = recommend_products(customer_id)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
+
+
+# ── Analytics ────────────────────────────────────────────────────────────────
+
+@app.get("/api/analytics/kpis")
+def analytics_kpis():
+    session = SessionLocal()
+    try:
+        total = session.query(func.count(Customer.customer_id)).scalar()
+        high_value = session.query(func.count(Customer.customer_id)).filter(
+            Customer.segment == "premium"
+        ).scalar()
+        affluent = session.query(func.count(Customer.customer_id)).filter(
+            Customer.segment == "affluent"
+        ).scalar()
+        # Hot leads: high balance + good credit
+        hot_leads = session.query(func.count(Customer.customer_id)).filter(
+            Customer.credit_score >= 720,
+            Customer.monthly_avg_balance >= 200000,
+        ).scalar()
+        # Pipeline value: sum of annual incomes for premium+affluent as proxy
+        pipeline = session.query(func.sum(Customer.annual_income)).filter(
+            Customer.segment.in_(["premium", "affluent"])
+        ).scalar() or 0
+        return {
+            "totalCustomers": total,
+            "highValue": high_value + affluent,
+            "hotLeads": hot_leads,
+            "pipelineValue": round(pipeline / 12, 0),  # monthly equivalent
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/analytics/charts")
+def analytics_charts():
+    session = SessionLocal()
+    try:
+        # Segment breakdown
+        seg_counts = (
+            session.query(Customer.segment, func.count(Customer.customer_id))
+            .group_by(Customer.segment)
+            .all()
+        )
+        segment_breakdown = [{"name": s.title(), "value": c} for s, c in seg_counts]
+
+        # Conversion trend: interactions by month for last 12 months
+        now = datetime.utcnow()
+        trend = []
+        for i in range(11, -1, -1):
+            month_start = (now.replace(day=1) - timedelta(days=30 * i))
+            month_end = (now.replace(day=1) - timedelta(days=30 * (i - 1))) if i > 0 else now
+            month_label = month_start.strftime("%b")
+            sent = session.query(func.count(Interaction.interaction_id)).filter(
+                Interaction.date >= month_start, Interaction.date < month_end
+            ).scalar()
+            converted = session.query(func.count(Interaction.interaction_id)).filter(
+                Interaction.date >= month_start,
+                Interaction.date < month_end,
+                Interaction.converted == True,
+            ).scalar()
+            responded = session.query(func.count(Interaction.interaction_id)).filter(
+                Interaction.date >= month_start,
+                Interaction.date < month_end,
+                Interaction.response.isnot(None),
+            ).scalar()
+            trend.append({
+                "month": month_label,
+                "sent": sent,
+                "responded": responded,
+                "converted": converted,
+            })
+
+        # Pipeline stages from interactions
+        stage_counts = (
+            session.query(Interaction.pipeline_state, func.count(Interaction.interaction_id))
+            .group_by(Interaction.pipeline_state)
+            .all()
+        )
+        pipeline_stages = [{"stage": s, "count": c} for s, c in stage_counts]
+
+        # Response rate by channel
+        channel_stats = (
+            session.query(Interaction.channel, func.count(Interaction.interaction_id))
+            .group_by(Interaction.channel)
+            .all()
+        )
+        response_rate = [{"channel": ch, "interactions": cnt} for ch, cnt in channel_stats]
+
+        return {
+            "segmentBreakdown": segment_breakdown,
+            "conversionTrend": trend,
+            "pipelineStages": pipeline_stages,
+            "responseRateData": response_rate,
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/analytics/campaigns")
+def analytics_campaigns():
+    session = SessionLocal()
+    try:
+        interactions = (
+            session.query(Interaction)
+            .order_by(Interaction.date.desc())
+            .limit(100)
+            .all()
+        )
+        return [
+            {
+                "interaction_id": i.interaction_id,
+                "customer_id": i.customer_id,
+                "channel": i.channel,
+                "product_offered": i.product_offered,
+                "converted": i.converted,
+                "pipeline_state": i.pipeline_state,
+                "framework_used": i.framework_used,
+                "date": i.date.isoformat(),
+            }
+            for i in interactions
+        ]
+    finally:
+        session.close()
+
+
+# ── Outreach ─────────────────────────────────────────────────────────────────
+
+class DraftRequest(BaseModel):
+    customer_name: str
+    product_id: str
+    framework: str = "AIDA"
+    tone: str = "professional"
+
+
+@app.post("/api/outreach/draft")
+def outreach_draft(body: DraftRequest):
+    result = draft_outreach_message(
+        customer_name=body.customer_name,
+        product_id=body.product_id,
+        framework=body.framework,
+        tone=body.tone,
+    )
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@app.get("/api/outreach/phone/{customer_id}")
+def get_customer_phone(customer_id: str):
+    """Look up a customer's mobile number from the IdentityGraph."""
+    session = SessionLocal()
+    try:
+        record = (
+            session.query(IdentityGraph)
+            .filter(
+                IdentityGraph.canonical_id == customer_id,
+                IdentityGraph.identifier_type == "mobile",
+            )
+            .first()
+        )
+        if not record:
+            return {"customer_id": customer_id, "phone": None}
+        phone = record.identifier_value
+        # Normalize to E.164 — add +91 if exactly 10 digits (Indian mobile)
+        if phone and not phone.startswith("+"):
+            digits = "".join(c for c in phone if c.isdigit())
+            if len(digits) == 10 and digits[0] in "6789":
+                # Indian mobile: 6xxx–9xxx
+                phone = f"+91{digits}"
+            else:
+                # Landline / unknown format — can't auto-normalize
+                phone = None
+        return {"customer_id": customer_id, "phone": phone}
+    finally:
+        session.close()
+
+
+class SendBatchItem(BaseModel):
+    customer_id: str
+    customer_name: str
+    product_id: str
+    message: str
+    phone_number: str          # E.164, e.g. +919876543210
+    framework: str = "AIDA"
+
+
+class SendBatchRequest(BaseModel):
+    drafts: list[SendBatchItem]
+    sandbox: bool = True                          # True = redirect all to sandbox_number
+    sandbox_number: str = ""                      # override; falls back to config default
+    sender_backend: str | None = None             # override SENDER_BACKEND for this batch
+
+
+@app.post("/api/outreach/send-batch")
+def send_batch(body: SendBatchRequest):
+    """
+    Send a batch of outreach messages (WhatsApp/Twilio/mock).
+
+    Sandbox mode: all messages redirect to a single test number.
+    Production mode: messages go to each customer's actual CRM number.
+    Backend can be overridden per-request: whatsapp-web | twilio | mock
+    """
+    effective_sandbox_number = (
+        body.sandbox_number.strip()
+        or settings.whatsapp_sandbox_number
+    )
+
+    # Temporarily override sender backend for this batch if requested
+    original_backend = settings.sender_backend
+    if body.sender_backend:
+        settings.sender_backend = body.sender_backend
+
+    results = []
+    try:
+        for item in body.drafts:
+            phone = effective_sandbox_number if body.sandbox else item.phone_number
+
+            result = _send_outreach(
+                customer_id=item.customer_id,
+                phone_number=phone,
+                message=item.message,
+                product_id=item.product_id,
+                framework_used=item.framework,
+            )
+
+            # Register sandbox session for AI reply routing
+            if body.sandbox:
+                _sandbox_sessions[effective_sandbox_number] = {
+                    "customer_id": item.customer_id,
+                    "product_id":  item.product_id,
+                    "message":     item.message,
+                }
+
+            results.append({
+                "customer_id":    item.customer_id,
+                "customer_name":  item.customer_name,
+                "intended_phone": item.phone_number,
+                "sent_to":        phone,
+                "sandbox":        body.sandbox,
+                **result,
+            })
+    finally:
+        settings.sender_backend = original_backend  # restore
+
+    return {
+        "sent":           len(results),
+        "sandbox":        body.sandbox,
+        "sandbox_number": effective_sandbox_number if body.sandbox else None,
+        "backend":        results[0].get("backend", "mock") if results else "mock",
+        "results":        results,
+    }
+
+
+@app.get("/api/outreach/campaigns")
+def outreach_campaigns():
+    session = SessionLocal()
+    try:
+        rows = (
+            session.query(Interaction)
+            .filter(Interaction.channel.isnot(None))
+            .order_by(Interaction.date.desc())
+            .limit(50)
+            .all()
+        )
+        # Group into "campaigns" by product+framework
+        campaigns: dict = {}
+        for r in rows:
+            key = f"{r.product_offered}-{r.framework_used}"
+            if key not in campaigns:
+                campaigns[key] = {
+                    "id": key,
+                    "product": r.product_offered,
+                    "framework": r.framework_used,
+                    "channel": r.channel,
+                    "sent": 0,
+                    "converted": 0,
+                    "started": r.date.isoformat(),
+                }
+            campaigns[key]["sent"] += 1
+            if r.converted:
+                campaigns[key]["converted"] += 1
+        result = list(campaigns.values())
+        for c in result:
+            c["conversion_rate"] = round(c["converted"] / c["sent"] * 100, 1) if c["sent"] else 0
+        return result
+    finally:
+        session.close()
+
+
+# ── Agent ────────────────────────────────────────────────────────────────────
+
+class AgentRequest(BaseModel):
+    query: str
+    llm_backend: str = "ollama"         # default backend for all nodes
+    planner_backend: str | None = None  # override for planner node only
+    executor_backend: str | None = None # override for executor node only
+    ollama_model: str | None = None     # specific ollama model (e.g. llama3.1:8b)
+    nvidia_model: str | None = None     # specific nvidia nim model
+
+
+def _build_provider(backend: str, ollama_model: str | None = None, nvidia_model: str | None = None):
+    if backend == "gemini":
+        from src.llm.gemini import GeminiProvider
+        return GeminiProvider()
+    if backend == "nvidia":
+        from src.llm.nvidia import NvidiaProvider
+        return NvidiaProvider(model=nvidia_model) if nvidia_model else NvidiaProvider()
+    from src.llm.ollama import OllamaProvider
+    return OllamaProvider(model=ollama_model) if ollama_model else OllamaProvider()
+
+
+@app.post("/api/agent/run")
+async def run_agent(body: AgentRequest):
+    # Only 1 LLM request fires at a time — queues extra requests instead of
+    # slamming them all into the per-minute quota window simultaneously.
+    async with _llm_semaphore:
+        provider = _build_provider(body.llm_backend, body.ollama_model, body.nvidia_model)
+
+        initial_state = create_initial_state(
+            body.query,
+            llm_backend=body.llm_backend,
+            llm_provider=provider,
+            planner_backend=body.planner_backend,
+            executor_backend=body.executor_backend,
+            ollama_model=body.ollama_model,
+            nvidia_model=body.nvidia_model,
+        )
+        try:
+            final_state = await asyncio.get_event_loop().run_in_executor(
+                None, _agent_graph.invoke, initial_state
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Agent error: {e}")
+
+    tool_steps = []
+    for call in final_state.get("tool_call_log", []):
+        tool_steps.append({
+            "id": call.get("timestamp", ""),
+            "type": "tool",
+            "label": call.get("tool_name", ""),
+            "detail": f"Tool: {call.get('tool_name')}",
+            "toolCall": {
+                "name": call.get("tool_name"),
+                "input": call.get("arguments", {}),
+                "output": call.get("result"),
+                "durationMs": 400,
+                "status": "success",
+            },
+            "startedAt": 1,
+            "endedAt": 2,
+        })
+
+    plan_steps = [
+        {
+            "id": f"plan-{i}",
+            "type": "plan",
+            "label": step,
+            "detail": step,
+            "startedAt": 1,
+            "endedAt": 2,
+        }
+        for i, step in enumerate(final_state.get("task_plan", []))
+    ]
+
+    all_steps = plan_steps + tool_steps + [
+        {
+            "id": "respond",
+            "type": "respond",
+            "label": "Synthesize response",
+            "detail": "LLM summarizes execution results",
+            "startedAt": 1,
+            "endedAt": 2,
+        }
+    ]
+
+    return {
+        "answer": final_state.get("final_answer", ""),
+        "steps": all_steps,
+        "customers": final_state.get("customer_set", [])[:10],
+        "drafts": final_state.get("drafts", []),
+        "tool_call_count": len(final_state.get("tool_call_log", [])),
+        "task_plan": final_state.get("task_plan", []),
+        "error": final_state.get("error"),
+    }
+
+
+# ── Settings ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/settings")
+def get_settings():
+    return {
+        "llm_backend": settings.llm_backend,
+        "ollama_model": settings.ollama_model,
+        "crm_backend": settings.crm_backend,
+        "sender_backend": settings.sender_backend,
+        "has_gemini_key": bool(settings.gemini_api_key),
+        "has_hubspot_key": bool(settings.hubspot_developer_key),
+        "has_twilio": bool(settings.twilio_account_sid and settings.twilio_auth_token),
+        "whatsapp_service_url": settings.whatsapp_service_url,
+        "whatsapp_sandbox": settings.whatsapp_sandbox,
+        "whatsapp_sandbox_number": settings.whatsapp_sandbox_number,
+    }
+
+
+class IncomingReplyRequest(BaseModel):
+    phone: str      # E.164 e.g. +917838146286
+    message: str    # What the customer said
+
+
+@app.post("/api/outreach/reply")
+def incoming_reply(body: IncomingReplyRequest):
+    """
+    Called by the WhatsApp Web JS service when a customer replies.
+    1. Match phone → customer via IdentityGraph
+    2. Find their most recent outreach interaction
+    3. Update interaction with their response + pipeline state
+    4. Run AI sales agent to generate a reply
+    5. Return { ai_reply: "..." } — the Node service sends it on WhatsApp
+    """
+    session = SessionLocal()
+    try:
+        # 1. Look up customer — check sandbox session map first
+        #    (in sandbox mode the reply comes from the RM's own number, not the customer's)
+        sandbox_ctx = _sandbox_sessions.get(body.phone)
+
+        if sandbox_ctx:
+            # Sandbox reply — use stored customer context
+            customer_id = sandbox_ctx["customer_id"]
+            customer    = session.query(Customer).filter_by(customer_id=customer_id).first()
+        else:
+            # Production reply — look up by phone in IdentityGraph
+            phone_digits = body.phone.replace("+", "").replace(" ", "")
+            identity = (
+                session.query(IdentityGraph)
+                .filter(
+                    IdentityGraph.identifier_type == "mobile",
+                    IdentityGraph.identifier_value.contains(phone_digits[-10:]),
+                )
+                .first()
+            )
+            customer_id = identity.canonical_id if identity else None
+            customer    = session.query(Customer).filter_by(customer_id=customer_id).first() if customer_id else None
+
+        # 2. Find latest outreach interaction for this customer
+        last_interaction = None
+        if customer_id:
+            last_interaction = (
+                session.query(Interaction)
+                .filter(
+                    Interaction.customer_id == customer_id,
+                    Interaction.channel == "whatsapp",
+                    Interaction.framework_used != "AI_AGENT",   # skip AI replies
+                )
+                .order_by(Interaction.date.desc())
+                .first()
+            )
+
+        # 3. Update interaction with reply + new pipeline state
+        intent = _classify_intent(body.message)
+        pipeline_map = {
+            "YES": "INTERESTED", "NO": "DECLINED", "PRICE_OBJECTION": "OBJECTION",
+            "DOCUMENTS": "ENGAGED", "TIMELINE": "ENGAGED", "WANTS_CALLBACK": "CALLBACK_REQUESTED",
+            "THINKING": "CONSIDERING", "HAS_PRODUCT": "OBJECTION", "GENERAL": "ENGAGED",
+        }
+        new_state = pipeline_map.get(intent, "ENGAGED")
+
+        if last_interaction:
+            last_interaction.response     = body.message
+            last_interaction.pipeline_state = new_state
+            if intent == "YES":
+                last_interaction.converted = True
+            session.commit()
+
+        # 4. Generate AI sales reply
+        ai_reply = None
+        if customer and last_interaction:
+            product = session.query(Product).filter_by(
+                product_id=last_interaction.product_offered
+            ).first()
+
+            if product:
+                income      = customer.annual_income or 0
+                loan_amount = min(income * 0.5, 2_500_000)
+                rate        = _rate_for_credit_score(customer.credit_score)
+                emi_val     = _emi(loan_amount, rate, 60)
+
+                ai_reply = generate_sales_reply(
+                    customer=customer,
+                    product=product,
+                    outreach_message=last_interaction.message or "",
+                    customer_reply=body.message,
+                    conversation_history=[
+                        {"role": "assistant", "content": last_interaction.message or ""},
+                        {"role": "user",      "content": body.message},
+                    ],
+                    loan_amount_str=_fmt_inr(loan_amount),
+                    rate=rate,
+                    emi_str=_fmt_inr(emi_val),
+                )
+
+                # Log AI reply as a new interaction
+                if ai_reply:
+                    import uuid
+                    ai_interaction = Interaction(
+                        interaction_id=f"INT_AI_{uuid.uuid4().hex[:12]}",
+                        customer_id=customer_id,
+                        date=datetime.utcnow(),
+                        channel="whatsapp",
+                        product_offered=last_interaction.product_offered,
+                        message=ai_reply,
+                        pipeline_state=new_state,
+                        framework_used="AI_AGENT",
+                    )
+                    session.add(ai_interaction)
+                    session.commit()
+        elif not customer:
+            # Unknown number — generic reply
+            ai_reply = "Thanks for your message! This number is for BankRM customer outreach. Please contact your branch for assistance."
+
+        return {
+            "customer_id":   customer_id,
+            "customer_name": customer.name if customer else None,
+            "intent":        intent,
+            "pipeline_state": new_state,
+            "ai_reply":      ai_reply,
+        }
+    finally:
+        session.close()
+
+
+@app.post("/api/outreach/twilio-webhook")
+async def twilio_webhook(request: Request):
+    """
+    Twilio WhatsApp inbound webhook.
+    Twilio POSTs here (form-encoded) whenever a customer:
+      - Taps a quick-reply button (Body = button text, ButtonText = button id)
+      - Sends a free-form WhatsApp message
+    We extract phone + text, run the same AI sales agent logic, then reply
+    with TwiML so Twilio sends the AI message back to the customer.
+    """
+    form = await request.form()
+    raw_phone = str(form.get("From", "")).replace("whatsapp:", "").strip()
+    body_text  = str(form.get("Body", "")).strip()
+    button_id  = str(form.get("ButtonText", "")).strip()   # quick-reply button id
+
+    # Prefer button id for intent classification (cleaner signal)
+    message_text = button_id if button_id else body_text
+    if not message_text:
+        return Response(content='<?xml version="1.0"?><Response></Response>',
+                        media_type="application/xml")
+
+    # Map button labels to intent-friendly text
+    BUTTON_MAP = {
+        "yes": "yes interested",
+        "callback": "call me callback",
+        "no": "not interested",
+    }
+    message_text = BUTTON_MAP.get(message_text.lower(), message_text)
+
+    # Reuse the existing reply logic
+    class _Req:
+        phone = raw_phone
+        message = message_text
+
+    # Call the core reply logic directly
+    session = SessionLocal()
+    try:
+        from src.tools.sales_agent import generate_sales_reply as _gen_reply
+        from src.database import Product
+
+        sandbox_ctx = _sandbox_sessions.get(raw_phone)
+        if sandbox_ctx:
+            customer_id = sandbox_ctx["customer_id"]
+            product_id  = sandbox_ctx["product_id"]
+            outreach_msg = sandbox_ctx["message"]
+            customer = session.query(Customer).filter_by(customer_id=customer_id).first()
+        else:
+            ig = (session.query(IdentityGraph)
+                  .filter_by(identifier_type="mobile", identifier_value=raw_phone)
+                  .first())
+            customer = session.query(Customer).filter_by(customer_id=ig.canonical_id).first() if ig else None
+            last_int  = (session.query(Interaction)
+                         .filter_by(customer_id=customer.customer_id, channel="whatsapp")
+                         .order_by(Interaction.date.desc()).first()) if customer else None
+            product_id   = last_int.product_offered if last_int else None
+            outreach_msg = last_int.message if last_int else ""
+            customer_id  = customer.customer_id if customer else None
+
+        if customer and product_id:
+            from src.tools.sales_agent import _classify_intent
+            intent    = _classify_intent(message_text)
+            new_state = {
+                "YES": "INTERESTED", "WANTS_CALLBACK": "CALLBACK_REQUESTED",
+                "PRICE_OBJECTION": "OBJECTION", "HAS_PRODUCT": "OBJECTION",
+                "NO": "DECLINED", "THINKING": "CONSIDERING",
+            }.get(intent, "ENGAGED")
+
+            # Save customer response
+            import uuid as _uuid
+            session.add(Interaction(
+                interaction_id=f"INT_TW_{_uuid.uuid4().hex[:10]}",
+                customer_id=customer_id,
+                date=datetime.utcnow(),
+                channel="whatsapp",
+                product_offered=product_id,
+                response=body_text,
+                pipeline_state=new_state,
+                framework_used="TWILIO_INBOUND",
+            ))
+            session.commit()
+
+            product = session.query(Product).filter_by(product_id=product_id).first()
+            if product:
+                from src.tools.message_tool import _rate_for_credit_score, _emi, _fmt_inr
+                rate = _rate_for_credit_score(customer.credit_score or 650)
+                loan = min(max(customer.annual_income or 500000, 200000), 2500000)
+                emi_val = _emi(loan, rate, 60)
+                ai_reply = _gen_reply(
+                    customer=customer, product=product,
+                    outreach_message=outreach_msg,
+                    customer_reply=message_text,
+                    conversation_history=[],
+                    loan_amount_str=_fmt_inr(loan),
+                    rate=rate, emi_str=_fmt_inr(emi_val),
+                )
+            else:
+                ai_reply = f"Thanks for your response! Our team will follow up shortly. 😊"
+
+            # Save AI reply
+            session.add(Interaction(
+                interaction_id=f"INT_TW_AI_{_uuid.uuid4().hex[:10]}",
+                customer_id=customer_id,
+                date=datetime.utcnow(),
+                channel="whatsapp",
+                product_offered=product_id,
+                message=ai_reply,
+                pipeline_state=new_state,
+                framework_used="AI_AGENT",
+            ))
+            session.commit()
+        else:
+            ai_reply = "Thanks for reaching out! Our team will get back to you shortly. 😊"
+    finally:
+        session.close()
+
+    # Return TwiML — Twilio sends this as a WhatsApp message back to the customer
+    twiml = f'<?xml version="1.0"?><Response><Message>{ai_reply}</Message></Response>'
+    return Response(content=twiml, media_type="application/xml")
+
+
+@app.get("/api/outreach/pipeline")
+def outreach_pipeline():
+    """
+    Pipeline summary — how many customers are at each stage.
+    Used by the dashboard to show the sales funnel.
+    """
+    session = SessionLocal()
+    try:
+        from sqlalchemy import func
+
+        # ── Funnel: latest pipeline_state per customer ───────────────────────
+        subq_latest = (
+            session.query(
+                Interaction.customer_id,
+                func.max(Interaction.date).label("latest")
+            )
+            .filter(Interaction.channel == "whatsapp")
+            .group_by(Interaction.customer_id)
+            .subquery()
+        )
+        latest_interactions = (
+            session.query(Interaction)
+            .join(subq_latest, (Interaction.customer_id == subq_latest.c.customer_id) &
+                               (Interaction.date == subq_latest.c.latest))
+            .all()
+        )
+
+        # Stage counts for funnel
+        stages: dict[str, int] = {}
+        for i in latest_interactions:
+            state = i.pipeline_state or "CONTACTED"
+            stages[state] = stages.get(state, 0) + 1
+
+        # ── Recent replies: latest customer-reply interaction per customer ───
+        # A customer reply has response set and framework_used != AI_AGENT
+        subq_reply = (
+            session.query(
+                Interaction.customer_id,
+                func.max(Interaction.date).label("latest")
+            )
+            .filter(
+                Interaction.channel == "whatsapp",
+                Interaction.response != None,
+                Interaction.response != "",
+            )
+            .group_by(Interaction.customer_id)
+            .subquery()
+        )
+        reply_interactions = (
+            session.query(Interaction)
+            .join(subq_reply, (Interaction.customer_id == subq_reply.c.customer_id) &
+                              (Interaction.date == subq_reply.c.latest))
+            .order_by(Interaction.date.desc())
+            .limit(20)
+            .all()
+        )
+
+        recent_replies = []
+        for i in reply_interactions:
+            c = session.query(Customer).filter_by(customer_id=i.customer_id).first()
+            # Find most recent AI reply after the customer response
+            ai_int = (
+                session.query(Interaction)
+                .filter(
+                    Interaction.customer_id == i.customer_id,
+                    Interaction.framework_used == "AI_AGENT",
+                    Interaction.date >= i.date,
+                )
+                .order_by(Interaction.date.asc())
+                .first()
+            )
+            # Use the latest state from funnel (not the reply row's state)
+            state = next(
+                (x.pipeline_state for x in latest_interactions if x.customer_id == i.customer_id),
+                i.pipeline_state or "CONTACTED"
+            ) or "CONTACTED"
+            recent_replies.append({
+                "customer_id":    i.customer_id,
+                "customer_name":  c.name if c else i.customer_id,
+                "response":       i.response,
+                "pipeline_state": state,
+                "product":        i.product_offered,
+                "date":           i.date.isoformat(),
+                "converted":      i.converted,
+                "ai_reply":       ai_int.message if ai_int else None,
+            })
+
+        # ── Funnel list ──────────────────────────────────────────────────────
+        funnel_order = ["CONTACTED", "ENGAGED", "CONSIDERING", "CALLBACK_REQUESTED",
+                        "INTERESTED", "OBJECTION", "DECLINED", "CONVERTED"]
+        funnel = [{"stage": s, "count": stages.get(s, 0)} for s in funnel_order]
+        for s, cnt in stages.items():
+            if s not in funnel_order:
+                funnel.append({"stage": s, "count": cnt})
+
+        return {
+            "funnel":           funnel,
+            "total_contacted":  sum(stages.values()),
+            "total_replied":    len(reply_interactions),
+            "total_converted":  sum(1 for i in latest_interactions if i.converted),
+            "recent_replies":   recent_replies[:20],
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/outreach/whatsapp-status")
+def whatsapp_status():
+    """
+    Proxy to the WhatsApp Web JS service to get connection status + QR code.
+    The frontend polls this every few seconds while setting up the session.
+    """
+    import urllib.request, urllib.error, json as _json
+    base = settings.whatsapp_service_url.rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base}/qr", timeout=3) as resp:
+            return _json.loads(resp.read())
+    except Exception as exc:
+        return {"ready": False, "state": "SERVICE_DOWN", "error": str(exc)}
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _customer_to_dict(c: Customer) -> dict:
+    products_held = sum([c.has_credit_card, c.has_personal_loan, c.has_home_loan, c.has_fd])
+    # Simple CLV score inline (avoid per-row DB queries)
+    income_norm = min((c.annual_income or 0) / 5_000_000, 1.0)
+    balance_norm = min((c.monthly_avg_balance or 0) / 1_000_000, 1.0)
+    credit_norm = ((c.credit_score or 550) - 550) / 350
+    score = round((income_norm * 0.3 + balance_norm * 0.3 + credit_norm * 0.4) * 100, 1)
+    return {
+        "customer_id": c.customer_id,
+        "name": c.name,
+        "age": c.age,
+        "gender": c.gender,
+        "city": c.city,
+        "segment": c.segment,
+        "occupation": c.occupation,
+        "annual_income": c.annual_income,
+        "monthly_avg_balance": c.monthly_avg_balance,
+        "credit_score": c.credit_score,
+        "relationship_years": c.relationship_years,
+        "kyc_status": c.kyc_status,
+        "has_credit_card": c.has_credit_card,
+        "has_personal_loan": c.has_personal_loan,
+        "has_home_loan": c.has_home_loan,
+        "has_fd": c.has_fd,
+        "clv_score": score,
+        "products_held": products_held,
+        "last_contact_date": c.last_contact_date.isoformat() if c.last_contact_date else None,
+    }
