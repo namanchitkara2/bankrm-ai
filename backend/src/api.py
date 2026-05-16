@@ -17,7 +17,7 @@ os.environ.setdefault("DATABASE_URL", f"sqlite:///{_BASE}/banking_crm.db")
 
 from src.database import (
     SessionLocal, Customer, Transaction, Interaction, Product, IdentityGraph, init_db,
-    CadenceJob, Suppression
+    CadenceJob, Suppression, AuditLog
 )
 from src.tools.customer_tool import query_customers as _query_customers, get_customer_profile
 from src.tools.scoring_tool import score_customer_value, predict_conversion_probability
@@ -773,6 +773,19 @@ async def twilio_webhook(request: Request):
             ))
             session.commit()
 
+            # Auto-route: if customer requested callback, schedule a follow-up job
+            if intent == "WANTS_CALLBACK":
+                followup_job = CadenceJob(
+                    job_id=str(_uuid.uuid4()),
+                    canonical_id=customer_id,
+                    product_id=product_id or "PL001",
+                    next_run_at=datetime.utcnow() + timedelta(hours=2),  # callback reminder in 2h
+                    step=1,
+                    status="pending",
+                )
+                session.add(followup_job)
+                session.commit()
+
             product = session.query(Product).filter_by(product_id=product_id).first()
             if product:
                 from src.tools.message_tool import _rate_for_credit_score, _emi, _fmt_inr
@@ -1236,6 +1249,225 @@ def morning_digest():
                 for j in due_jobs
             ],
             "hot_leads": [interaction_summary(i) for i in hot_leads],
+        }
+    finally:
+        session.close()
+
+
+# ── Analytics: Churn & Cross-sell ────────────────────────────────────────────
+
+@app.get("/api/analytics/churn-signals")
+def get_churn_signals(limit: int = Query(20, le=50)):
+    """Get customers with highest churn risk scores."""
+    from src.tools.scoring_tool import detect_churn_signals
+    session = SessionLocal()
+    try:
+        # Sample recent active customers for churn scoring
+        customers = session.query(Customer).filter(
+            Customer.kyc_status == "verified"
+        ).limit(100).all()
+
+        results = []
+        for c in customers:
+            try:
+                churn = detect_churn_signals(c.customer_id)
+                if churn.get("churn_risk") in ("medium", "high"):
+                    results.append({
+                        "customer_id": c.customer_id,
+                        "name": c.name,
+                        "segment": c.segment,
+                        "city": c.city,
+                        "churn_risk": churn["churn_risk"],
+                        "risk_score": churn["risk_score"],
+                        "signals": [s["signal"] for s in churn.get("signals", [])],
+                        "recommendation": churn.get("recommendation", ""),
+                        "annual_income": c.annual_income,
+                        "monthly_avg_balance": c.monthly_avg_balance,
+                    })
+            except Exception:
+                continue
+
+        results.sort(key=lambda x: x["risk_score"], reverse=True)
+        return {
+            "at_risk_count": len(results),
+            "high_risk": sum(1 for r in results if r["churn_risk"] == "high"),
+            "medium_risk": sum(1 for r in results if r["churn_risk"] == "medium"),
+            "customers": results[:limit],
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/analytics/cross-sell")
+def get_cross_sell_opportunities(limit: int = Query(20, le=50)):
+    """Get top cross-sell opportunities across portfolio."""
+    from src.tools.scoring_tool import detect_cross_sell_opportunities
+    session = SessionLocal()
+    try:
+        customers = session.query(Customer).filter(
+            Customer.kyc_status == "verified"
+        ).limit(80).all()
+
+        all_opps = []
+        for c in customers:
+            try:
+                opps = detect_cross_sell_opportunities(c.customer_id)
+                for opp in opps[:1]:  # top opp per customer
+                    all_opps.append({
+                        "customer_id": c.customer_id,
+                        "name": c.name,
+                        "segment": c.segment,
+                        "product_name": opp["product_name"],
+                        "product_id": opp["product_id"],
+                        "reason": opp["reason"],
+                        "confidence": round(opp["confidence"] * 100, 1),
+                        "urgency": opp["urgency"],
+                    })
+            except Exception:
+                continue
+
+        all_opps.sort(key=lambda x: x["confidence"], reverse=True)
+
+        # Group by product
+        by_product: dict = {}
+        for o in all_opps:
+            p = o["product_name"]
+            by_product[p] = by_product.get(p, 0) + 1
+
+        return {
+            "total_opportunities": len(all_opps),
+            "by_product": by_product,
+            "top_opportunities": all_opps[:limit],
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/analytics/reply-rates")
+def get_reply_rates():
+    """Reply rates broken down by segment, pipeline stage, and day of week."""
+    session = SessionLocal()
+    try:
+        now = datetime.utcnow()
+        thirty_days_ago = now - timedelta(days=30)
+
+        interactions = session.query(Interaction).filter(
+            Interaction.date >= thirty_days_ago,
+        ).all()
+
+        # By segment
+        segment_stats: dict = {}
+        for i in interactions:
+            c = session.query(Customer).filter_by(customer_id=i.customer_id).first()
+            if not c:
+                continue
+            seg = c.segment or "unknown"
+            if seg not in segment_stats:
+                segment_stats[seg] = {"sent": 0, "replied": 0}
+            segment_stats[seg]["sent"] += 1
+            if i.response and i.response.strip():
+                segment_stats[seg]["replied"] += 1
+
+        segment_reply_rates = [
+            {
+                "segment": seg,
+                "sent": stats["sent"],
+                "replied": stats["replied"],
+                "reply_rate": round(stats["replied"] / stats["sent"] * 100, 1) if stats["sent"] > 0 else 0,
+            }
+            for seg, stats in segment_stats.items()
+        ]
+
+        # By day of week
+        dow_stats: dict = {}
+        for i in interactions:
+            if i.date:
+                dow = i.date.strftime("%a")  # Mon, Tue, etc.
+                if dow not in dow_stats:
+                    dow_stats[dow] = {"sent": 0, "replied": 0}
+                dow_stats[dow]["sent"] += 1
+                if i.response and i.response.strip():
+                    dow_stats[dow]["replied"] += 1
+
+        day_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        dow_reply_rates = [
+            {
+                "day": dow,
+                "reply_rate": round(dow_stats.get(dow, {}).get("replied", 0) / max(dow_stats.get(dow, {}).get("sent", 1), 1) * 100, 1),
+                "sent": dow_stats.get(dow, {}).get("sent", 0),
+            }
+            for dow in day_order
+        ]
+
+        # Overall stats
+        total_sent = len(interactions)
+        total_replied = sum(1 for i in interactions if i.response and i.response.strip())
+        total_converted = sum(1 for i in interactions if i.converted)
+
+        return {
+            "period": "last_30_days",
+            "overall": {
+                "sent": total_sent,
+                "replied": total_replied,
+                "converted": total_converted,
+                "reply_rate": round(total_replied / total_sent * 100, 1) if total_sent > 0 else 0,
+                "conversion_rate": round(total_converted / total_replied * 100, 1) if total_replied > 0 else 0,
+            },
+            "by_segment": segment_reply_rates,
+            "by_day_of_week": dow_reply_rates,
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/customers/{customer_id}/intelligence")
+def get_customer_intelligence(customer_id: str):
+    """Full customer intelligence: life events + churn signals + cross-sell opportunities + behavioral signals."""
+    from src.tools.scoring_tool import detect_life_events, get_behavioral_signals, detect_churn_signals, detect_cross_sell_opportunities
+
+    try:
+        life_events = detect_life_events(customer_id)
+        behavioral = get_behavioral_signals(customer_id)
+        churn = detect_churn_signals(customer_id)
+        cross_sell = detect_cross_sell_opportunities(customer_id)
+
+        return {
+            "customer_id": customer_id,
+            "life_events": life_events,
+            "behavioral_signals": behavioral,
+            "churn": churn,
+            "cross_sell_opportunities": cross_sell,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── Audit Log ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/audit-log")
+def get_audit_log(limit: int = Query(50, le=200), customer_id: Optional[str] = None):
+    """Retrieve audit log entries."""
+    session = SessionLocal()
+    try:
+        q = session.query(AuditLog).order_by(AuditLog.timestamp.desc())
+        if customer_id:
+            q = q.filter(AuditLog.customer_id == customer_id)
+        entries = q.limit(limit).all()
+        return {
+            "entries": [
+                {
+                    "log_id": e.log_id,
+                    "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+                    "action": e.action,
+                    "actor": e.actor,
+                    "customer_id": e.customer_id,
+                    "product_id": e.product_id,
+                    "channel": e.channel,
+                    "details": e.details,
+                    "outcome": e.outcome,
+                }
+                for e in entries
+            ]
         }
     finally:
         session.close()

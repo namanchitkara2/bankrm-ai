@@ -164,6 +164,22 @@ class CadenceJob(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class AuditLog(Base):
+    """Audit trail for every significant action — banking compliance."""
+    __tablename__ = "audit_logs"
+
+    log_id = Column(String, primary_key=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    action = Column(String, nullable=False)        # SEND, REPLY, OPT_OUT, CAMPAIGN_RUN, VALIDATION_FAIL
+    actor = Column(String, nullable=True)          # "system" | "rm" | "ai_agent"
+    customer_id = Column(String, nullable=True)
+    product_id = Column(String, nullable=True)
+    channel = Column(String, nullable=True)        # whatsapp, twilio
+    details = Column(JSON, nullable=True)          # arbitrary extra data
+    outcome = Column(String, nullable=True)        # success, blocked, suppressed, error
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 # Database engine and session
 engine = create_engine(settings.database_url, echo=settings.debug)
 SessionLocal = sessionmaker(bind=engine)

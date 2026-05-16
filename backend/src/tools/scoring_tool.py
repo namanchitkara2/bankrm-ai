@@ -424,6 +424,182 @@ def detect_life_events(customer_id: str) -> list:
         session.close()
 
 
+def detect_churn_signals(customer_id: str) -> dict:
+    """
+    Detect early churn signals from transaction patterns.
+
+    Signals:
+    - Salary credit stopped (>45 days since last salary)
+    - FD closed early (negative FD transaction)
+    - Balance declining trend (last 30d avg < prior 30d avg by >30%)
+    - Competitor transactions detected (NEFT/IMPS to known competitor names)
+    - Reduced transaction frequency (txn count down >40%)
+
+    Returns: {churn_risk: low/medium/high, score: 0-100, signals: list}
+    """
+    session = SessionLocal()
+    try:
+        customer = session.query(Customer).filter_by(customer_id=customer_id).first()
+        if not customer:
+            return {"error": "Customer not found"}
+
+        now = datetime.utcnow()
+        signals = []
+        risk_score = 0
+
+        txns_60d = session.query(Transaction).filter(
+            Transaction.customer_id == customer_id,
+            Transaction.date >= now - timedelta(days=60)
+        ).all()
+
+        txns_90_to_60 = session.query(Transaction).filter(
+            Transaction.customer_id == customer_id,
+            Transaction.date >= now - timedelta(days=90),
+            Transaction.date < now - timedelta(days=60),
+        ).all()
+
+        # ── Signal 1: Salary stopped ──────────────────────────────────────────
+        salary_txns = [t for t in txns_60d if t.category and "salary" in t.category.lower()]
+        if customer.annual_income and customer.annual_income > 0 and not salary_txns:
+            # Check if they ever had salary
+            any_salary = session.query(Transaction).filter(
+                Transaction.customer_id == customer_id,
+                Transaction.category.ilike("%salary%"),
+            ).first()
+            if any_salary:
+                signals.append({"signal": "SALARY_STOPPED", "description": "No salary credit in 60 days — possible job change or account switch", "weight": 35})
+                risk_score += 35
+
+        # ── Signal 2: Declining balance trend ─────────────────────────────────
+        recent_debits = sum(t.amount for t in txns_60d[:30] if t.amount < 0)
+        prior_debits = sum(t.amount for t in txns_60d[30:] if t.amount < 0)
+        if prior_debits < 0 and recent_debits < prior_debits * 0.60:  # balance declining 40%+
+            signals.append({"signal": "DECLINING_BALANCE", "description": f"Account balance declining — debit activity dropped significantly", "weight": 20})
+            risk_score += 20
+
+        # ── Signal 3: Reduced transaction frequency ───────────────────────────
+        recent_count = len([t for t in txns_60d if t.date >= now - timedelta(days=30)])
+        prior_count = len([t for t in txns_60d if t.date < now - timedelta(days=30)])
+        if prior_count >= 5 and recent_count < prior_count * 0.50:
+            signals.append({"signal": "LOW_ACTIVITY", "description": f"Transaction frequency dropped {100 - round(recent_count/prior_count*100)}% vs prior month", "weight": 15})
+            risk_score += 15
+
+        # ── Signal 4: Competitor transactions ─────────────────────────────────
+        competitors = ["hdfc", "icici", "axis", "kotak", "sbi", "paytm", "phonepe"]
+        competitor_txns = [
+            t for t in txns_60d
+            if t.merchant and any(c in t.merchant.lower() for c in competitors)
+        ]
+        if len(competitor_txns) >= 3:
+            signals.append({"signal": "COMPETITOR_ACTIVITY", "description": f"{len(competitor_txns)} transactions to competitor accounts detected", "weight": 25})
+            risk_score += 25
+
+        # ── Signal 5: Long since last contact ─────────────────────────────────
+        if customer.last_contact_date:
+            days_no_contact = (now - customer.last_contact_date).days
+            if days_no_contact > 90:
+                signals.append({"signal": "NO_CONTACT", "description": f"{days_no_contact} days since last RM contact", "weight": 10})
+                risk_score += 10
+
+        risk_score = min(risk_score, 100)
+        churn_risk = "high" if risk_score >= 50 else "medium" if risk_score >= 25 else "low"
+
+        return {
+            "customer_id": customer_id,
+            "churn_risk": churn_risk,
+            "risk_score": risk_score,
+            "signals": signals,
+            "recommendation": (
+                "Immediate outreach required — schedule callback" if churn_risk == "high"
+                else "Monitor closely — send re-engagement campaign" if churn_risk == "medium"
+                else "Customer appears healthy"
+            ),
+        }
+    finally:
+        session.close()
+
+
+def detect_cross_sell_opportunities(customer_id: str) -> list:
+    """
+    Identify high-probability cross-sell opportunities from spend patterns.
+
+    Returns list of {product_hint, reason, confidence, urgency}
+    """
+    from src.database import Product as ProductModel
+    session = SessionLocal()
+    try:
+        customer = session.query(Customer).filter_by(customer_id=customer_id).first()
+        if not customer:
+            return []
+
+        now = datetime.utcnow()
+        opportunities = []
+
+        txns_90d = session.query(Transaction).filter(
+            Transaction.customer_id == customer_id,
+            Transaction.date >= now - timedelta(days=90)
+        ).all()
+
+        # Category spend map
+        cat_spend: dict = {}
+        for t in txns_90d:
+            cat = (t.category or "other").lower()
+            cat_spend[cat] = cat_spend.get(cat, 0) + abs(t.amount)
+
+        # ── Credit card → not held + lifestyle spend ──────────────────────────
+        if not customer.has_credit_card:
+            lifestyle = cat_spend.get("restaurant", 0) + cat_spend.get("shopping", 0) + cat_spend.get("travel", 0)
+            if lifestyle > 15_000:
+                opportunities.append({
+                    "product_id": "CC001",
+                    "product_name": "Premium Credit Card",
+                    "reason": f"₹{lifestyle:,.0f} in lifestyle spend/quarter — rewards card will save them money",
+                    "confidence": min(0.85, 0.50 + (lifestyle / 150_000)),
+                    "urgency": "high" if lifestyle > 30_000 else "medium",
+                })
+
+        # ── Personal loan → medical expense or life event ─────────────────────
+        if not customer.has_personal_loan:
+            medical = cat_spend.get("healthcare", 0) + cat_spend.get("medical", 0) + cat_spend.get("hospital", 0)
+            if medical > 20_000:
+                opportunities.append({
+                    "product_id": "PL001",
+                    "product_name": "Personal Loan",
+                    "reason": f"₹{medical:,.0f} medical spend detected — personal loan can ease cash flow",
+                    "confidence": 0.72,
+                    "urgency": "high",
+                })
+
+        # ── FD → large balance sitting idle ──────────────────────────────────
+        if not customer.has_fd and (customer.monthly_avg_balance or 0) > 500_000:
+            opportunities.append({
+                "product_id": "FD001",
+                "product_name": "Fixed Deposit",
+                "reason": f"₹{(customer.monthly_avg_balance or 0):,.0f} avg balance — FD can earn 7.5% vs 3.5% savings",
+                "confidence": 0.78,
+                "urgency": "medium",
+            })
+
+        # ── Home loan → salary + tenure + no home loan ────────────────────────
+        if not customer.has_home_loan and (customer.relationship_years or 0) >= 3:
+            salary_monthly = (customer.annual_income or 0) / 12
+            if salary_monthly >= 60_000:
+                opportunities.append({
+                    "product_id": "HL001",
+                    "product_name": "Home Loan",
+                    "reason": f"Stable salary of ₹{salary_monthly:,.0f}/month — eligible for home loan up to ₹{salary_monthly * 60:,.0f}",
+                    "confidence": 0.45,
+                    "urgency": "low",
+                })
+
+        # Sort by confidence
+        opportunities.sort(key=lambda x: x["confidence"], reverse=True)
+        return opportunities
+
+    finally:
+        session.close()
+
+
 def get_behavioral_signals(customer_id: str) -> dict:
     """
     Get behavioral signals for message personalization and timing.

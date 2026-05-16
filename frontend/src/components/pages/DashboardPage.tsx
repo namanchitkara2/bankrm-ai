@@ -4,7 +4,7 @@ import { kpis as mockKpis, customers as mockCustomers, segmentBreakdown as mockS
 import { motion } from "framer-motion";
 import {
   Users, TrendingUp, Flame, Wallet, Send, Activity,
-  Sparkles, ArrowUpRight, ArrowRight,
+  Sparkles, ArrowUpRight, ArrowRight, AlertTriangle,
 } from "lucide-react";
 import {
   AreaChart, Area, ResponsiveContainer, Tooltip, XAxis, YAxis,
@@ -30,6 +30,24 @@ export function DashboardPage() {
     queryKey: ["customers", "recent"],
     queryFn: () => customersApi.list({ limit: 6 }),
     staleTime: 60_000,
+  });
+
+  const { data: digestData } = useQuery({
+    queryKey: ["morning-digest"],
+    queryFn: () => fetch("http://localhost:8000/api/digest/morning").then(r => r.json()),
+    staleTime: 300_000,
+  });
+
+  const { data: churnAlerts } = useQuery({
+    queryKey: ["churn-alerts"],
+    queryFn: () => fetch("http://localhost:8000/api/analytics/churn-signals?limit=5").then(r => r.json()),
+    staleTime: 300_000,
+  });
+
+  const { data: crossSellData } = useQuery({
+    queryKey: ["cross-sell-dashboard"],
+    queryFn: () => fetch("http://localhost:8000/api/analytics/cross-sell?limit=4").then(r => r.json()),
+    staleTime: 300_000,
   });
 
   const kpis = kpiData ?? mockKpis;
@@ -92,6 +110,44 @@ export function DashboardPage() {
           </motion.div>
         ))}
       </div>
+
+      {/* Morning Digest */}
+      {digestData && (digestData.summary.overnight_replies > 0 || digestData.summary.callbacks_due > 0) && (
+        <div className="glass rounded-xl p-5 shadow-card border border-warning/30">
+          <div className="flex items-center gap-2 mb-3">
+            <span className="text-base">📋</span>
+            <div className="text-sm font-semibold">Morning Digest</div>
+            <span className="text-[10px] text-muted-foreground ml-auto">{new Date().toLocaleTimeString()}</span>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            {[
+              { label: "Overnight Replies", value: digestData.summary.overnight_replies, color: "text-primary", emoji: "💬" },
+              { label: "Callbacks Due", value: digestData.summary.callbacks_due, color: "text-warning", emoji: "📞" },
+              { label: "Follow-ups Due", value: digestData.summary.followups_due_today, color: "text-accent", emoji: "🔁" },
+              { label: "Hot Leads", value: digestData.summary.hot_leads, color: "text-success", emoji: "🔥" },
+            ].map(item => (
+              <div key={item.label} className="bg-muted/30 rounded-lg p-3 text-center">
+                <div className="text-xl">{item.emoji}</div>
+                <div className={`text-2xl font-bold mt-1 ${item.color}`}>{item.value}</div>
+                <div className="text-[10px] text-muted-foreground mt-0.5">{item.label}</div>
+              </div>
+            ))}
+          </div>
+          {digestData.callbacks_requested?.length > 0 && (
+            <div className="mt-3 space-y-1">
+              <div className="text-xs text-muted-foreground font-medium">Pending callbacks:</div>
+              {digestData.callbacks_requested.slice(0, 3).map((cb: { customer_id: string; name: string; city: string; pipeline_state: string }) => (
+                <div key={cb.customer_id} className="flex items-center gap-2 text-xs py-1">
+                  <span className="text-warning">📞</span>
+                  <span className="font-medium">{cb.name}</span>
+                  <span className="text-muted-foreground">{cb.city}</span>
+                  <span className="ml-auto text-muted-foreground">{cb.pipeline_state}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Charts */}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
@@ -206,6 +262,75 @@ export function DashboardPage() {
             ))}
           </div>
         </div>
+      </div>
+
+      {/* Churn Alerts + Cross-sell Opportunities */}
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+
+        {/* Churn Alerts */}
+        {churnAlerts?.high_risk > 0 && (
+          <div className="glass rounded-xl p-5 shadow-card border border-destructive/20">
+            <div className="flex items-center gap-2 mb-3">
+              <AlertTriangle className="w-4 h-4 text-destructive" />
+              <div className="text-sm font-semibold">Churn Alerts</div>
+              <span className="ml-2 text-xs bg-destructive/15 text-destructive px-2 py-0.5 rounded-full">{churnAlerts.high_risk} high risk</span>
+            </div>
+            <div className="space-y-2">
+              {churnAlerts.customers
+                ?.filter((c: { churn_risk: string }) => c.churn_risk === "high")
+                .slice(0, 4)
+                .map((c: { customer_id: string; risk_score: number; name: string; signals?: string[]; segment: string }) => (
+                  <div key={c.customer_id} className="flex items-center gap-3 p-2.5 rounded-lg bg-destructive/5 border border-destructive/10">
+                    <div className="w-8 h-8 rounded-full bg-destructive/20 grid place-items-center text-xs font-bold text-destructive">
+                      {c.risk_score}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs font-medium">{c.name}</div>
+                      <div className="text-[10px] text-muted-foreground truncate">{c.signals?.join(" · ")}</div>
+                    </div>
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-destructive/15 text-destructive">{c.segment}</span>
+                  </div>
+                ))}
+            </div>
+          </div>
+        )}
+
+        {/* Cross-sell Opportunities */}
+        {crossSellData?.customers?.length > 0 && (
+          <div className="glass rounded-xl p-5 shadow-card border border-primary/20">
+            <div className="flex items-center gap-2 mb-3">
+              <Sparkles className="w-4 h-4 text-primary" />
+              <div className="text-sm font-semibold">Cross-sell Opportunities</div>
+              {crossSellData.total_opportunities != null && (
+                <span className="ml-2 text-xs bg-primary/15 text-primary px-2 py-0.5 rounded-full">{crossSellData.total_opportunities} total</span>
+              )}
+            </div>
+            <div className="space-y-2">
+              {crossSellData.customers
+                .slice(0, 4)
+                .map((opp: { customer_id: string; name: string; product: string; reason?: string; confidence?: number }) => (
+                  <div key={opp.customer_id} className="flex items-center gap-3 p-2.5 rounded-lg bg-primary/5 border border-primary/10">
+                    <div className="w-8 h-8 rounded-full bg-primary/20 grid place-items-center text-[10px] font-bold text-primary shrink-0">
+                      {opp.name.split(" ").map((p: string) => p[0]).slice(0, 2).join("")}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs font-medium">{opp.name}</div>
+                      <div className="text-[10px] text-muted-foreground truncate">{opp.reason ?? opp.product}</div>
+                      {opp.confidence != null && (
+                        <div className="mt-1 flex items-center gap-2">
+                          <div className="flex-1 h-1 bg-muted rounded">
+                            <div className="h-full rounded bg-primary" style={{ width: `${opp.confidence}%` }} />
+                          </div>
+                          <span className="text-[10px] text-muted-foreground">{opp.confidence}%</span>
+                        </div>
+                      )}
+                    </div>
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/15 text-primary shrink-0">{opp.product}</span>
+                  </div>
+                ))}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Activity */}

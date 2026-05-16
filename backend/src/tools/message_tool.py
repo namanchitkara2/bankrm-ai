@@ -85,6 +85,71 @@ def _build_trust_line(customer: Customer, txn_context: Optional[dict]) -> str:
     return f"Based on your banking profile"
 
 
+def validate_message_facts(message: str, customer_id: str, product_id: str) -> dict:
+    """
+    Hallucination prevention — validate financial facts in message against DB.
+
+    Checks:
+    1. Interest rate in message matches DB rate for customer's credit score
+    2. Loan amount doesn't exceed eligibility (5x annual income for personal loan)
+    3. No obviously fake timelines promised ("same day" for home loans, etc.)
+
+    Returns: {valid: bool, issues: list, corrected_rate: float, corrected_amount: float}
+    """
+    import re
+    from src.database import SessionLocal, Customer, Product
+
+    issues = []
+    session = SessionLocal()
+    try:
+        customer = session.query(Customer).filter_by(customer_id=customer_id).first()
+        product = session.query(Product).filter_by(product_id=product_id).first()
+        if not customer or not product:
+            return {"valid": True, "issues": [], "warning": "Could not load customer/product for validation"}
+
+        # ── Check 1: Interest rate ─────────────────────────────────────────────
+        correct_rate = _rate_for_credit_score(customer.credit_score)
+        # Find rates mentioned in message (e.g. "10.5%", "11%", "9.99% p.a.")
+        mentioned_rates = [float(r) for r in re.findall(r'(\d+(?:\.\d+)?)\s*%', message)]
+        for rate in mentioned_rates:
+            if abs(rate - correct_rate) > 2.0:  # allow 2% tolerance
+                issues.append(
+                    f"Rate {rate}% in message doesn't match customer's eligible rate {correct_rate}% "
+                    f"(credit score {customer.credit_score})"
+                )
+
+        # ── Check 2: Loan amount eligibility ──────────────────────────────────
+        if product_id == "PL001" and customer.annual_income:
+            max_eligible = customer.annual_income * 5
+            # Find amounts mentioned (e.g. "₹5,00,000", "5 lakh", "₹15L")
+            amounts_lakh = [float(a) * 100_000 for a in re.findall(r'(\d+(?:\.\d+)?)\s*[Ll]akh', message)]
+            amounts_raw = [float(a.replace(',','')) for a in re.findall(r'₹\s*([\d,]+)', message)]
+            all_amounts = amounts_lakh + amounts_raw
+            for amt in all_amounts:
+                if amt > max_eligible * 1.1:  # 10% tolerance
+                    issues.append(
+                        f"Loan amount ₹{amt:,.0f} exceeds customer eligibility "
+                        f"₹{max_eligible:,.0f} (5× income of ₹{customer.annual_income:,.0f})"
+                    )
+
+        # ── Check 3: Impossible timelines ─────────────────────────────────────
+        if product_id == "HL001":  # Home loan
+            bad_promises = ["same day", "24 hours", "instant", "immediate", "today"]
+            msg_lower = message.lower()
+            for bp in bad_promises:
+                if bp in msg_lower:
+                    issues.append(f"Home loans cannot be disbursed '{bp}' — this promise is inaccurate")
+
+        return {
+            "valid": len(issues) == 0,
+            "issues": issues,
+            "corrected_rate": correct_rate,
+            "max_eligible_amount": (customer.annual_income or 0) * 5 if product_id == "PL001" else None,
+        }
+    finally:
+        session.close()
+
+
 def _conversion_to_tone(prob: Optional[float]) -> str:
     if prob is None:
         return "warm"
@@ -93,6 +158,56 @@ def _conversion_to_tone(prob: Optional[float]) -> str:
     if prob >= 0.35:
         return "professional"
     return "urgent"
+
+
+def _cta_for_stage(pipeline_stage: str, product_type: str = "personal_loan") -> str:
+    """
+    Return the best CTA based on pipeline stage.
+
+    Cold (NEW/CONTACTED):    curiosity-driven, low commitment
+    Warm (ENGAGED/CONSIDERING): specific offer, time-bound
+    Hot (INTERESTED/CALLBACK): scheduling, immediate next step
+    """
+    stage = (pipeline_stage or "NEW").upper()
+
+    cold_ctas = {
+        "personal_loan": "Curious what your EMI would be? Just reply with your preferred loan amount and I'll calculate it instantly.",
+        "credit_card": "Want to see what rewards you'd earn on your current monthly spend? Just say YES and I'll show you.",
+        "home_loan": "Wondering what home you could afford? Reply with your monthly income and I'll run the numbers.",
+        "fd": "Want to see how much your balance could earn in a Fixed Deposit vs savings account? Reply to find out.",
+    }
+    warm_ctas = {
+        "personal_loan": "Want me to hold this rate for 48 hours? Just say YES and I'll lock it in for you.",
+        "credit_card": "Ready to apply? Your pre-approval takes under 2 minutes — just say GO and I'll share the link.",
+        "home_loan": "Shall I check your exact eligibility? It takes 5 minutes and doesn't affect your credit score.",
+        "fd": "Shall I open a short-tenure FD while you decide on the full amount? Even 30 days earns more.",
+    }
+    hot_ctas = {
+        "personal_loan": "I have a 10am or 2pm slot tomorrow for a 10-minute call. Which works for you?",
+        "credit_card": "The card can be dispatched to your address by Friday. Shall I proceed?",
+        "home_loan": "Let me connect you directly with our home loan specialist — she's available tomorrow 11am. Shall I book it?",
+        "fd": "I can open the FD right now if you have 5 minutes. Want to do it over the phone?",
+    }
+
+    hot_stages = {"INTERESTED", "CALLBACK_REQUESTED", "CLOSING"}
+    warm_stages = {"ENGAGED", "CONSIDERING", "THINKING"}
+
+    pt = product_type.lower().replace(" ", "_").replace("-", "_")
+    if "credit" in pt or "cc" in pt:
+        pt = "credit_card"
+    elif "home" in pt or "hl" in pt:
+        pt = "home_loan"
+    elif "fd" in pt or "deposit" in pt:
+        pt = "fd"
+    else:
+        pt = "personal_loan"
+
+    if stage in hot_stages:
+        return hot_ctas.get(pt, hot_ctas["personal_loan"])
+    elif stage in warm_stages:
+        return warm_ctas.get(pt, warm_ctas["personal_loan"])
+    else:
+        return cold_ctas.get(pt, cold_ctas["personal_loan"])
 
 
 # ── Product-specific message builders ─────────────────────────────────────────
