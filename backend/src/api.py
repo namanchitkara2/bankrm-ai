@@ -885,6 +885,34 @@ def outreach_pipeline():
         recent_replies = []
         for i in reply_interactions:
             c = session.query(Customer).filter_by(customer_id=i.customer_id).first()
+
+            # Find the original outreach message (first CONTACTED interaction)
+            original_outreach = (
+                session.query(Interaction)
+                .filter(
+                    Interaction.customer_id == i.customer_id,
+                    Interaction.pipeline_state == "CONTACTED",
+                    Interaction.message != None,
+                    Interaction.message != "",
+                    Interaction.message != "Outreach message about product",
+                )
+                .order_by(Interaction.date.asc())
+                .first()
+            )
+            # Fallback: any interaction with a non-placeholder message
+            if not original_outreach:
+                original_outreach = (
+                    session.query(Interaction)
+                    .filter(
+                        Interaction.customer_id == i.customer_id,
+                        Interaction.message != None,
+                        Interaction.message != "",
+                        Interaction.message != "Outreach message about product",
+                    )
+                    .order_by(Interaction.date.asc())
+                    .first()
+                )
+
             # Find most recent AI reply after the customer response
             ai_int = (
                 session.query(Interaction)
@@ -896,20 +924,57 @@ def outreach_pipeline():
                 .order_by(Interaction.date.asc())
                 .first()
             )
+
+            # Get full conversation history for this customer (all interactions in order)
+            all_interactions = (
+                session.query(Interaction)
+                .filter(Interaction.customer_id == i.customer_id)
+                .order_by(Interaction.date.asc())
+                .all()
+            )
+            conversation_thread = []
+            seen_rm_contents: set[str] = set()   # dedup identical outreach blasts
+            for intr in all_interactions:
+                # The RM outreach message — skip identical duplicates
+                if intr.message and intr.message.strip() and intr.message != "Outreach message about product":
+                    content_key = intr.message.strip()
+                    if content_key not in seen_rm_contents:
+                        seen_rm_contents.add(content_key)
+                        conversation_thread.append({
+                            "role": "rm",
+                            "content": intr.message,
+                            "date": intr.date.isoformat() if intr.date else None,
+                            "type": "outreach" if intr.framework_used != "AI_AGENT" else "ai_response",
+                        })
+                # The customer's reply
+                if intr.response and intr.response.strip():
+                    # After a customer reply, allow RM to re-send (clear dedup set)
+                    seen_rm_contents.clear()
+                    conversation_thread.append({
+                        "role": "customer",
+                        "content": intr.response,
+                        "date": intr.date.isoformat() if intr.date else None,
+                        "type": "reply",
+                    })
+
             # Use the latest state from funnel (not the reply row's state)
             state = next(
                 (x.pipeline_state for x in latest_interactions if x.customer_id == i.customer_id),
                 i.pipeline_state or "CONTACTED"
             ) or "CONTACTED"
+
             recent_replies.append({
-                "customer_id":    i.customer_id,
-                "customer_name":  c.name if c else i.customer_id,
-                "response":       i.response,
-                "pipeline_state": state,
-                "product":        i.product_offered,
-                "date":           i.date.isoformat(),
-                "converted":      i.converted,
-                "ai_reply":       ai_int.message if ai_int else None,
+                "customer_id":       i.customer_id,
+                "customer_name":     c.name if c else i.customer_id,
+                "response":          i.response,
+                "pipeline_state":    state,
+                "product":           i.product_offered,
+                "date":              i.date.isoformat(),
+                "converted":         i.converted,
+                "ai_reply":          ai_int.message if ai_int else None,
+                "outreach_message":  original_outreach.message if original_outreach else None,
+                "conversation_thread": conversation_thread,
+                "product_offered":   i.product_offered or (original_outreach.product_offered if original_outreach else None),
             })
 
         # ── Funnel list ──────────────────────────────────────────────────────
@@ -997,10 +1062,11 @@ def preview_campaign(req: CampaignRequest):
             life_events = signals.get("life_events", [])
             timing_score = signals.get("timing_score", 50)
 
-            # Draft message
+            # Draft message — correct arg order: (customer_name, product_id, framework, tone, customer_id=...)
             try:
-                draft = draft_outreach_message(c.customer_id, req.product_id, req.tone)
-                message_preview = draft.get("message", "")[:200] + "..." if len(draft.get("message","")) > 200 else draft.get("message","")
+                draft = draft_outreach_message(c.name, req.product_id, "AIDA", req.tone, customer_id=c.customer_id)
+                raw_msg = draft.get("primary_message", "") or draft.get("short_variant", "")
+                message_preview = raw_msg[:200] + "..." if len(raw_msg) > 200 else raw_msg
             except Exception:
                 message_preview = ""
 

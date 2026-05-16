@@ -294,15 +294,25 @@ export interface PipelineFunnelStage {
   count: number;
 }
 
+export interface ConversationTurn {
+  role: "rm" | "customer";
+  content: string;
+  date: string | null;
+  type: "outreach" | "reply" | "ai_response";
+}
+
 export interface PipelineReply {
   customer_id: string;
   customer_name: string;
   response: string;
   pipeline_state: string;
   product: string | null;
+  product_offered: string | null;
   date: string;
   converted: boolean;
   ai_reply?: string | null;
+  outreach_message?: string | null;
+  conversation_thread?: ConversationTurn[];
   intent?: string | null;
 }
 

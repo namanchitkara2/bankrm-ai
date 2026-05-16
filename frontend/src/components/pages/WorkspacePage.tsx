@@ -9,7 +9,7 @@ import {
 import {
   Send, Sparkles, Brain, Wrench, CheckCircle2, Loader2, ArrowRight,
   MessageSquare, Activity, ChevronDown, ChevronRight, Zap, AlertCircle,
-  Cloud, Server, Cpu, ChevronUp, Settings2, X, Phone,
+  Cloud, Server, Cpu, ChevronUp, Settings2, X, Phone, History, Clock, Trash2,
 } from "lucide-react";
 
 type ChatMessage = {
@@ -20,6 +20,46 @@ type ChatMessage = {
   result?: AgentResult | null;
   error?: string;
 };
+
+// ── History (localStorage) ────────────────────────────────────────────────────
+
+const HISTORY_KEY = "bankrm_workspace_history";
+const MAX_HISTORY = 20;
+
+type HistorySession = {
+  id: string;
+  timestamp: string;
+  summary: string;          // first user message, truncated
+  messageCount: number;
+  messages: ChatMessage[];
+};
+
+function loadHistory(): HistorySession[] {
+  try {
+    return JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]");
+  } catch {
+    return [];
+  }
+}
+
+function saveToHistory(messages: ChatMessage[]) {
+  if (!messages.some(m => m.role === "user")) return;
+  const userMsg = messages.find(m => m.role === "user");
+  const session: HistorySession = {
+    id: crypto.randomUUID(),
+    timestamp: new Date().toISOString(),
+    summary: (userMsg?.content ?? "Session").slice(0, 80),
+    messageCount: messages.length,
+    messages,
+  };
+  const existing = loadHistory();
+  const updated = [session, ...existing].slice(0, MAX_HISTORY);
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(updated));
+}
+
+function clearHistory() {
+  localStorage.removeItem(HISTORY_KEY);
+}
 
 const SUGGESTED = [
   "Find high-value customers likely to convert for a personal loan this month",
@@ -305,6 +345,11 @@ export function WorkspacePage() {
   const [plannerModel, setPlannerModel] = useState("gemini-flash");
   const [executorModel, setExecutorModel] = useState("ollama-gemma3");
 
+  // History state
+  const [rightTab, setRightTab] = useState<"workflow" | "history">("workflow");
+  const [history, setHistory] = useState<HistorySession[]>(() => loadHistory());
+  const [viewingSession, setViewingSession] = useState<HistorySession | null>(null);
+
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, running]);
@@ -335,13 +380,17 @@ export function WorkspacePage() {
 
     try {
       const result = await agentApi.run(text, activeConfig);
-      setMessages((m) =>
-        m.map((msg) =>
+      setMessages((m) => {
+        const updated = m.map((msg) =>
           msg.id === agentMsg.id
             ? { ...msg, content: result.answer ?? "Agent completed.", steps: result.steps ?? [], result, error: result.error ?? undefined }
             : msg
-        )
-      );
+        );
+        // Save completed session to history
+        saveToHistory(updated);
+        setHistory(loadHistory());
+        return updated;
+      });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : "Unknown error";
       setMessages((m) =>
@@ -453,31 +502,135 @@ export function WorkspacePage() {
           </div>
         </div>
 
-        {/* Right rail: workflow */}
-        <div className="glass rounded-xl p-5 shadow-card flex flex-col overflow-hidden">
-          <div className="flex items-center gap-2 mb-1">
-            <Activity className="w-4 h-4 text-accent" />
-            <div className="text-sm font-semibold">Workflow</div>
+        {/* Right rail: Workflow | History tabs */}
+        <div className="glass rounded-xl shadow-card flex flex-col overflow-hidden">
+          {/* Tab bar */}
+          <div className="flex border-b border-border">
+            {[
+              { id: "workflow" as const, icon: Activity, label: "Workflow" },
+              { id: "history" as const, icon: History, label: `History${history.length > 0 ? ` (${history.length})` : ""}` },
+            ].map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => { setRightTab(tab.id); setViewingSession(null); }}
+                className={`flex-1 flex items-center justify-center gap-1.5 py-3 text-xs font-medium transition border-b-2 ${
+                  rightTab === tab.id
+                    ? "border-primary text-primary"
+                    : "border-transparent text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <tab.icon className="w-3.5 h-3.5" />
+                {tab.label}
+              </button>
+            ))}
           </div>
-          {/* Active model badges */}
-          <div className="flex flex-wrap gap-1.5 mb-3">
-            {splitMode ? (
-              <>
-                <span className="flex items-center gap-1 text-[9px] px-2 py-0.5 rounded-full bg-primary/10 border border-primary/20 text-primary">
-                  <Brain className="w-2.5 h-2.5" /> {modelById(plannerModel).label}
-                </span>
-                <span className="flex items-center gap-1 text-[9px] px-2 py-0.5 rounded-full bg-accent/10 border border-accent/20 text-accent">
-                  <Wrench className="w-2.5 h-2.5" /> {modelById(executorModel).label}
-                </span>
-              </>
-            ) : (
-              <span className="flex items-center gap-1 text-[9px] px-2 py-0.5 rounded-full bg-muted border border-border text-muted-foreground">
-                <Settings2 className="w-2.5 h-2.5" /> {modelById(globalModel).label}
-              </span>
-            )}
-          </div>
-          <div className="text-xs text-muted-foreground mb-4">Live LangGraph node execution</div>
-          <WorkflowMini running={running} steps={latestAgentMsg?.steps} splitMode={splitMode} plannerModel={plannerModel} executorModel={executorModel} globalModel={globalModel} />
+
+          {/* Workflow panel */}
+          {rightTab === "workflow" && (
+            <div className="p-5 flex flex-col flex-1 overflow-hidden">
+              <div className="flex flex-wrap gap-1.5 mb-3">
+                {splitMode ? (
+                  <>
+                    <span className="flex items-center gap-1 text-[9px] px-2 py-0.5 rounded-full bg-primary/10 border border-primary/20 text-primary">
+                      <Brain className="w-2.5 h-2.5" /> {modelById(plannerModel).label}
+                    </span>
+                    <span className="flex items-center gap-1 text-[9px] px-2 py-0.5 rounded-full bg-accent/10 border border-accent/20 text-accent">
+                      <Wrench className="w-2.5 h-2.5" /> {modelById(executorModel).label}
+                    </span>
+                  </>
+                ) : (
+                  <span className="flex items-center gap-1 text-[9px] px-2 py-0.5 rounded-full bg-muted border border-border text-muted-foreground">
+                    <Settings2 className="w-2.5 h-2.5" /> {modelById(globalModel).label}
+                  </span>
+                )}
+              </div>
+              <div className="text-xs text-muted-foreground mb-4">Live LangGraph node execution</div>
+              <WorkflowMini running={running} steps={latestAgentMsg?.steps} splitMode={splitMode} plannerModel={plannerModel} executorModel={executorModel} globalModel={globalModel} />
+            </div>
+          )}
+
+          {/* History panel */}
+          {rightTab === "history" && (
+            <div className="flex-1 flex flex-col overflow-hidden">
+              {viewingSession ? (
+                /* Session detail view */
+                <div className="flex flex-col flex-1 overflow-hidden">
+                  <div className="flex items-center gap-2 px-4 py-3 border-b border-border">
+                    <button
+                      onClick={() => setViewingSession(null)}
+                      className="text-xs text-primary hover:underline flex items-center gap-1"
+                    >
+                      ← Back
+                    </button>
+                    <span className="text-[10px] text-muted-foreground ml-auto">
+                      {new Date(viewingSession.timestamp).toLocaleDateString()}
+                    </span>
+                  </div>
+                  <div className="flex-1 overflow-y-auto p-3 space-y-3">
+                    {viewingSession.messages.map((m) => (
+                      <div key={m.id} className={`text-xs rounded-lg p-2.5 ${m.role === "user" ? "bg-primary/10 border border-primary/20 ml-4" : "bg-muted/40 border border-border mr-4"}`}>
+                        <div className="text-[10px] text-muted-foreground mb-1 font-medium">{m.role === "user" ? "You" : "AI Agent"}</div>
+                        <div className="leading-relaxed line-clamp-6">{m.content || (m.error ? `Error: ${m.error}` : "…")}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="px-4 py-3 border-t border-border">
+                    <button
+                      onClick={() => { setMessages(viewingSession.messages); setViewingSession(null); setRightTab("workflow"); }}
+                      className="w-full text-xs py-2 rounded-lg bg-primary/10 border border-primary/30 text-primary hover:bg-primary/20 transition font-medium"
+                    >
+                      Restore this session
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                /* Session list */
+                <div className="flex-1 overflow-y-auto">
+                  {history.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center h-full text-center p-6 gap-3">
+                      <History className="w-10 h-10 text-muted-foreground/30" />
+                      <div className="text-xs text-muted-foreground">No sessions yet.<br />Your workspace conversations will appear here.</div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="flex items-center justify-between px-4 py-2.5 border-b border-border">
+                        <span className="text-[10px] text-muted-foreground">{history.length} sessions saved</span>
+                        <button
+                          onClick={() => { clearHistory(); setHistory([]); }}
+                          className="text-[10px] text-muted-foreground hover:text-destructive flex items-center gap-1 transition"
+                        >
+                          <Trash2 className="w-3 h-3" /> Clear
+                        </button>
+                      </div>
+                      <div className="divide-y divide-border">
+                        {history.map((session) => (
+                          <button
+                            key={session.id}
+                            onClick={() => setViewingSession(session)}
+                            className="w-full text-left px-4 py-3 hover:bg-muted/30 transition group"
+                          >
+                            <div className="flex items-start gap-2">
+                              <MessageSquare className="w-3.5 h-3.5 text-muted-foreground mt-0.5 flex-shrink-0 group-hover:text-primary transition" />
+                              <div className="flex-1 min-w-0">
+                                <div className="text-xs font-medium truncate group-hover:text-primary transition">{session.summary}</div>
+                                <div className="flex items-center gap-2 mt-0.5">
+                                  <Clock className="w-2.5 h-2.5 text-muted-foreground" />
+                                  <span className="text-[10px] text-muted-foreground">
+                                    {new Date(session.timestamp).toLocaleDateString([], { month: "short", day: "numeric" })} · {new Date(session.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                                  </span>
+                                  <span className="text-[10px] text-muted-foreground ml-auto">{session.messageCount} msgs</span>
+                                </div>
+                              </div>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>

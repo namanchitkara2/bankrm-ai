@@ -273,7 +273,7 @@ export function CampaignPage() {
           product_id: productId,
           segment: segment === "All" ? null : segment.toLowerCase(),
           city: city.trim() || null,
-          min_conversion_probability: minProb,
+          min_conversion_probability: minProb / 100,   // slider is 0-100, API expects 0.0-1.0
           tone,
           max_leads: maxLeads,
           sender_backend: "whatsapp",
@@ -302,11 +302,17 @@ export function CampaignPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          campaign_id: preview.campaign_id,
-          leads: leads.map((l) => ({
+          drafts: leads.map((l) => ({
             customer_id: l.customer_id,
-            message: l.message_preview,
+            customer_name: l.name,
+            phone_number: "",          // backend uses sandbox number or CRM phone
+            message: l.message_preview || `Hi ${l.name.split(" ")[0]}! Your personalized offer for ${preview.product_name} is ready. Reply YES to learn more.`,
+            product_id: productId,
+            framework: "AIDA",
           })),
+          sandbox: false,
+          sandbox_number: "",
+          sender_backend: "whatsapp",
         }),
       });
     } catch {
